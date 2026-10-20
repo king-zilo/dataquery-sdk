@@ -7,9 +7,10 @@ import importlib.util
 import json
 import os
 import sys
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine, Iterable
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 from dataquery import DataQuery
@@ -17,7 +18,7 @@ from dataquery.types.exceptions import DataQueryError
 from dataquery.types.models import DownloadStatus, Paginated, TimeSeriesResponse
 
 
-def _to_dict(payload: Any) -> Dict[str, Any]:
+def _to_dict(payload: Any) -> dict[str, Any]:
     """Normalize a Pydantic model or dict into a plain dict for JSON dump."""
     if payload is None:
         return {}
@@ -28,7 +29,7 @@ def _to_dict(payload: Any) -> Dict[str, Any]:
     return {"value": payload}
 
 
-def _count_timeseries(data: Dict[str, Any]) -> tuple[int, int, str, str]:
+def _count_timeseries(data: dict[str, Any]) -> tuple[int, int, str, str]:
     """Return (instrument_count, data_point_count, first_date, last_date)."""
     instruments = data.get("instruments", []) or []
     total = 0
@@ -52,11 +53,11 @@ def _print_endpoint_result(
     summary: str,
     payload: Any,
     *,
-    csv_info: Optional[Dict[str, Any]] = None,
+    csv_info: dict[str, Any] | None = None,
 ) -> None:
     """Print summary line(s) followed by ``--- JSON ---`` + raw JSON payload."""
     data = _to_dict(payload)
-    envelope: Dict[str, Any] = {"status": "success", "data": data}
+    envelope: dict[str, Any] = {"status": "success", "data": data}
     if csv_info:
         envelope["csv_exported"] = csv_info.get("path", "stdout")
         envelope["csv_rows"] = csv_info.get("rows", 0)
@@ -72,8 +73,8 @@ def _print_endpoint_result(
     print(json.dumps(envelope, indent=2, default=str))
 
 
-def _print_error(message: str, *, suggestion: Optional[str] = None) -> None:
-    envelope: Dict[str, Any] = {"status": "error", "error_description": message}
+def _print_error(message: str, *, suggestion: str | None = None) -> None:
+    envelope: dict[str, Any] = {"status": "error", "error_description": message}
     if suggestion:
         envelope["suggestion"] = suggestion
     print(message, file=sys.stderr)
@@ -81,18 +82,27 @@ def _print_error(message: str, *, suggestion: Optional[str] = None) -> None:
     print(json.dumps(envelope, indent=2))
 
 
+@dataclass(frozen=True, slots=True)
+class _CredentialFlag:
+    """An ``mcp-connect``/``mcp-install`` flag and the unprefixed ``DATAQUERY_*`` key it sets."""
+
+    attr: str
+    env_key: str
+
+
 _MCP_CREDENTIAL_FLAGS = (
-    ("client_id", "CLIENT_ID"),
-    ("client_secret", "CLIENT_SECRET"),
-    ("bearer_token", "BEARER_TOKEN"),
+    _CredentialFlag("client_id", "CLIENT_ID"),
+    _CredentialFlag("client_secret", "CLIENT_SECRET"),
+    _CredentialFlag("bearer_token", "BEARER_TOKEN"),
 )
+_MCP_CREDENTIAL_KEYS = tuple(flag.env_key for flag in _MCP_CREDENTIAL_FLAGS)
 
 # Endpoint settings saved alongside the credentials, so a later DataQuery()
 # mints tokens against the same environment instead of the PROD defaults.
 _MCP_SAVED_SETTINGS = ("BASE_URL", "OAUTH_TOKEN_URL", "OAUTH_AUD")
 
 
-def _export_mcp_credentials(args: argparse.Namespace) -> List[str]:
+def _export_mcp_credentials(args: argparse.Namespace) -> list[str]:
     """Export ``mcp-connect`` credential flags into the ``DATAQUERY_*`` process env.
 
     Flags win over anything already exported, so the rest of this process —
@@ -102,26 +112,24 @@ def _export_mcp_credentials(args: argparse.Namespace) -> List[str]:
     """
     from dataquery.config import EnvConfig
 
-    for attr, env_key in _MCP_CREDENTIAL_FLAGS:
-        value = getattr(args, attr, None)
+    for flag in _MCP_CREDENTIAL_FLAGS:
+        value = getattr(args, flag.attr, None)
         if value:
-            os.environ[f"{EnvConfig.PREFIX}{env_key}"] = value
+            os.environ[f"{EnvConfig.PREFIX}{flag.env_key}"] = value
 
-    keys = [env_key for _, env_key in _MCP_CREDENTIAL_FLAGS] + list(_MCP_SAVED_SETTINGS)
+    keys = [*_MCP_CREDENTIAL_KEYS, *_MCP_SAVED_SETTINGS]
     # os.environ rather than get_env_var: model defaults must not be persisted
     # as if the user had chosen them.
     return [key for key in keys if os.environ.get(f"{EnvConfig.PREFIX}{key}")]
 
 
-def _save_mcp_credentials(keys: List[str]) -> None:
+def _save_mcp_credentials(keys: list[str]) -> None:
     """Persist the resolved credentials to the user-level ``.env``.
 
     Best effort: a failure here is reported but never takes the MCP connection
     down with it. Messages go to stderr — stdout is the JSON-RPC channel.
     """
-    from dataquery.config import EnvConfig
-
-    if not any(key in keys for key in ("CLIENT_ID", "CLIENT_SECRET", "BEARER_TOKEN")):
+    if not any(key in keys for key in _MCP_CREDENTIAL_KEYS):
         print(
             "--save-credentials: nothing to save; pass --client-id/--client-secret "
             "or set DATAQUERY_CLIENT_ID/DATAQUERY_CLIENT_SECRET.",
@@ -129,17 +137,24 @@ def _save_mcp_credentials(keys: List[str]) -> None:
         )
         return
 
-    values = {key: os.environ.get(f"{EnvConfig.PREFIX}{key}") for key in keys}
     try:
-        env_file = EnvConfig.save_user_env(values)
+        message = _save_user_env(keys)
     except OSError as exc:
         print(f"--save-credentials: could not write credentials: {exc}", file=sys.stderr)
         return
+    print(message, file=sys.stderr)
+
+
+def _save_user_env(keys: list[str]) -> str:
+    """Save the current ``DATAQUERY_<key>`` values to the user-level ``.env``; return the report line."""
+    from dataquery.config import EnvConfig
+
+    env_file = EnvConfig.save_user_env({key: os.environ.get(f"{EnvConfig.PREFIX}{key}") for key in keys})
     saved = ", ".join(f"{EnvConfig.PREFIX}{key}" for key in keys)
-    print(f"Saved {saved} to {env_file} (owner-only)", file=sys.stderr)
+    return f"Saved {saved} to {env_file} (owner-only)"
 
 
-def _has_mcp_credentials(keys: List[str]) -> bool:
+def _has_mcp_credentials(keys: list[str]) -> bool:
     """A bearer token, or a complete OAuth client ID + secret pair."""
     return "BEARER_TOKEN" in keys or {"CLIENT_ID", "CLIENT_SECRET"} <= set(keys)
 
@@ -176,6 +191,12 @@ def _prompt_for_mcp_credentials() -> None:
             value = ask(label).strip()
             if value:
                 os.environ[env_key] = value
+
+
+_ATTRIBUTES_HELP = (
+    "Attribute ID, used verbatim (repeat for multiple). IDs often contain "
+    "commas, e.g. --attributes 'TR,,LOC' --attributes 'TR,1DR,LOC'"
+)
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -364,10 +385,7 @@ def create_parser() -> argparse.ArgumentParser:
         "--attributes",
         required=True,
         action="append",
-        help=(
-            "Attribute ID, used verbatim (repeat for multiple). IDs often contain "
-            "commas, e.g. --attributes 'TR,,LOC' --attributes 'TR,1DR,LOC'"
-        ),
+        help=_ATTRIBUTES_HELP,
     )
     p_gts.add_argument("--filter", default=None, help='Filter string (e.g. "currency(USD)")')
     _ts_args(p_gts)
@@ -383,10 +401,7 @@ def create_parser() -> argparse.ArgumentParser:
         "--attributes",
         required=True,
         action="append",
-        help=(
-            "Attribute ID, used verbatim (repeat for multiple). IDs often contain "
-            "commas, e.g. --attributes 'TR,,LOC' --attributes 'TR,1DR,LOC'"
-        ),
+        help=_ATTRIBUTES_HELP,
     )
     _ts_args(p_its)
 
@@ -544,6 +559,17 @@ def create_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _dump_items(items: Iterable[Any]) -> list[Any]:
+    """``model_dump()`` each item, falling back to ``str()`` for anything that can't be dumped."""
+    payload: list[Any] = []
+    for item in items:
+        try:
+            payload.append(item.model_dump())
+        except Exception:
+            payload.append(str(item))
+    return payload
+
+
 async def cmd_groups(args: argparse.Namespace) -> int:
     async with DataQuery(args.env_file) as dq:
         if args.search:
@@ -551,13 +577,7 @@ async def cmd_groups(args: argparse.Namespace) -> int:
         else:
             items = await dq.list_groups_async(limit=args.limit)
         if args.json:
-            payload = []
-            for g in items:
-                try:
-                    payload.append(g.model_dump())
-                except Exception:
-                    payload.append(str(g))
-            print(json.dumps(payload, indent=2))
+            print(json.dumps(_dump_items(items), indent=2))
         else:
             for g in items:
                 try:
@@ -572,13 +592,7 @@ async def cmd_files(args: argparse.Namespace) -> int:
     async with DataQuery(args.env_file) as dq:
         files = await dq.list_files_async(args.group_id, args.file_group_id)
         if args.json:
-            payload = []
-            for f in files:
-                try:
-                    payload.append(f.model_dump())
-                except Exception:
-                    payload.append(str(f))
-            print(json.dumps(payload, indent=2))
+            print(json.dumps(_dump_items(files), indent=2))
         else:
             print(f"Found {len(files)} files")
             for f in files:
@@ -805,71 +819,62 @@ async def cmd_groups_search(args: argparse.Namespace) -> int:
     return 0
 
 
+def _catalog_summary(resp: Any, key: str, describe: Callable[[int], str]) -> str:
+    """Describe the number of ``key`` entries in ``resp``, plus a next-page hint if there is one."""
+    count = len(_to_dict(resp).get(key, []) or [])
+    return describe(count) + _more_pages_note(resp)
+
+
 async def cmd_instruments(args: argparse.Namespace) -> int:
     async with DataQuery(args.env_file) as dq:
         resp = await dq.list_instruments_async(args.group_id, args.instrument_id, args.page)
-    data = _to_dict(resp)
-    n = len(data.get("instruments", []) or [])
-    summary = f"Found {n} instrument(s) in {args.group_id}" + _more_pages_note(resp)
-    _print_endpoint_result(summary, resp)
+    _print_endpoint_result(
+        _catalog_summary(resp, "instruments", lambda n: f"Found {n} instrument(s) in {args.group_id}"), resp
+    )
     return 0
 
 
 async def cmd_instruments_search(args: argparse.Namespace) -> int:
     async with DataQuery(args.env_file) as dq:
         resp = await dq.search_instruments_async(args.group_id, args.keywords, args.page)
-    data = _to_dict(resp)
-    n = len(data.get("instruments", []) or [])
-    summary = f"Found {n} instrument(s) in {args.group_id} matching '{args.keywords}'" + _more_pages_note(resp)
-    _print_endpoint_result(summary, resp)
+    _print_endpoint_result(
+        _catalog_summary(
+            resp, "instruments", lambda n: f"Found {n} instrument(s) in {args.group_id} matching '{args.keywords}'"
+        ),
+        resp,
+    )
     return 0
 
 
 async def cmd_filters(args: argparse.Namespace) -> int:
     async with DataQuery(args.env_file) as dq:
         resp = await dq.get_group_filters_async(args.group_id, args.page)
-    data = _to_dict(resp)
-    n = len(data.get("filters", []) or [])
-    summary = f"Found {n} filter dimension(s) for {args.group_id}" + _more_pages_note(resp)
-    _print_endpoint_result(summary, resp)
+    _print_endpoint_result(
+        _catalog_summary(resp, "filters", lambda n: f"Found {n} filter dimension(s) for {args.group_id}"), resp
+    )
     return 0
 
 
 async def cmd_attributes(args: argparse.Namespace) -> int:
     async with DataQuery(args.env_file) as dq:
         resp = await dq.get_group_attributes_async(args.group_id, args.instrument_id, args.page)
-    data = _to_dict(resp)
-    n = len(data.get("instruments", []) or [])
-    summary = f"Attributes for {n} instrument(s) in {args.group_id}" + _more_pages_note(resp)
-    _print_endpoint_result(summary, resp)
+    _print_endpoint_result(
+        _catalog_summary(resp, "instruments", lambda n: f"Attributes for {n} instrument(s) in {args.group_id}"), resp
+    )
     return 0
 
 
-def _ts_kwargs(args: argparse.Namespace) -> Dict[str, Any]:
+_TS_FIELDS = ("data", "start_date", "end_date", "calendar", "frequency", "conversion", "nan_treatment", "page")
+
+
+def _ts_kwargs(args: argparse.Namespace) -> dict[str, Any]:
     """Map shared time-series CLI args to SDK keyword arguments, skipping None."""
-    kwargs: Dict[str, Any] = {}
-    if args.data is not None:
-        kwargs["data"] = args.data
-    if args.start_date is not None:
-        kwargs["start_date"] = args.start_date
-    if args.end_date is not None:
-        kwargs["end_date"] = args.end_date
-    if args.calendar is not None:
-        kwargs["calendar"] = args.calendar
-    if args.frequency is not None:
-        kwargs["frequency"] = args.frequency
-    if args.conversion is not None:
-        kwargs["conversion"] = args.conversion
-    if args.nan_treatment is not None:
-        kwargs["nan_treatment"] = args.nan_treatment
-    if args.page is not None:
-        kwargs["page"] = args.page
-    return kwargs
+    return {field: value for field in _TS_FIELDS if (value := getattr(args, field)) is not None}
 
 
-def _timeseries_messages(data: Dict[str, Any]) -> List[str]:
+def _timeseries_messages(data: dict[str, Any]) -> list[str]:
     """Collect per-series server messages (e.g. ``Expression syntax error!``)."""
-    messages: List[str] = []
+    messages: list[str] = []
     for inst in data.get("instruments", []) or []:
         for attr in inst.get("attributes", []) or []:
             message = attr.get("message")
@@ -879,7 +884,7 @@ def _timeseries_messages(data: Dict[str, Any]) -> List[str]:
     return messages
 
 
-def _next_page_token(resp: Any) -> Optional[str]:
+def _next_page_token(resp: Any) -> str | None:
     """Return the ``page`` token of the next page, or ``None`` on the last page."""
     if not isinstance(resp, Paginated):
         return None
@@ -895,7 +900,7 @@ def _more_pages_note(resp: Any) -> str:
     return f"\nMore pages available; fetch the next one with --page {token}" if token else ""
 
 
-async def _collect_all_pages(dq: Any, resp: Any, page: Optional[str]) -> tuple[Any, Optional[str]]:
+async def _collect_all_pages(dq: Any, resp: Any, page: str | None) -> tuple[Any, str | None]:
     """Merge every following page into ``resp`` unless one page was asked for via ``--page``.
 
     Returns ``(resp, warning)``. If a later page fails, the pages already fetched
@@ -905,7 +910,7 @@ async def _collect_all_pages(dq: Any, resp: Any, page: Optional[str]) -> tuple[A
         return resp, None
     last = resp
     pages = 1
-    warning: Optional[str] = None
+    warning: str | None = None
     while last.has_next_page():
         try:
             nxt = await dq.get_next_page_async(last)
@@ -925,7 +930,7 @@ async def _collect_all_pages(dq: Any, resp: Any, page: Optional[str]) -> tuple[A
     return resp, warning
 
 
-def _with_warning(summary: str, warning: Optional[str]) -> str:
+def _with_warning(summary: str, warning: str | None) -> str:
     return f"{summary}\n{warning}" if warning else summary
 
 
@@ -939,7 +944,7 @@ def _timeseries_summary(label: str, resp: Any) -> str:
     return summary + _more_pages_note(resp)
 
 
-def _maybe_export_csv(resp: Any, output_csv: Optional[str], is_grid: bool = False) -> Optional[Dict[str, Any]]:
+def _maybe_export_csv(resp: Any, output_csv: str | None, is_grid: bool = False) -> dict[str, Any] | None:
     if not output_csv:
         return None
     from .export import export_grid_csv, export_timeseries_csv
@@ -951,7 +956,7 @@ def _maybe_export_csv(resp: Any, output_csv: Optional[str], is_grid: bool = Fals
     return info
 
 
-def _print_result_with_csv(summary: str, resp: Any, output_csv: Optional[str], is_grid: bool = False) -> None:
+def _print_result_with_csv(summary: str, resp: Any, output_csv: str | None, is_grid: bool = False) -> None:
     """Export CSV, then print the result; if the export fails, print the summary before re-raising."""
     try:
         csv_info = _maybe_export_csv(resp, output_csv, is_grid=is_grid)
@@ -961,48 +966,39 @@ def _print_result_with_csv(summary: str, resp: Any, output_csv: Optional[str], i
     _print_endpoint_result(summary, resp, csv_info=csv_info)
 
 
-async def cmd_group_timeseries(args: argparse.Namespace) -> int:
-    attributes = args.attributes
+async def _run_timeseries(args: argparse.Namespace, label: str, fetch: Callable[[DataQuery], Awaitable[Any]]) -> int:
+    """Fetch every page of a time-series request, then print (and optionally export) the result."""
     async with DataQuery(args.env_file) as dq:
-        resp = await dq.get_group_time_series_async(
-            args.group_id,
-            attributes,
-            filter=args.filter,
-            **_ts_kwargs(args),
-        )
+        resp = await fetch(dq)
         resp, warning = await _collect_all_pages(dq, resp, args.page)
-    _print_result_with_csv(
-        _with_warning(_timeseries_summary("Group time-series", resp), warning), resp, args.output_csv
-    )
+    _print_result_with_csv(_with_warning(_timeseries_summary(label, resp), warning), resp, args.output_csv)
     return 1 if warning else 0
+
+
+async def cmd_group_timeseries(args: argparse.Namespace) -> int:
+    return await _run_timeseries(
+        args,
+        "Group time-series",
+        lambda dq: dq.get_group_time_series_async(
+            args.group_id, args.attributes, filter=args.filter, **_ts_kwargs(args)
+        ),
+    )
 
 
 async def cmd_instrument_timeseries(args: argparse.Namespace) -> int:
-    attributes = args.attributes
-    async with DataQuery(args.env_file) as dq:
-        resp = await dq.get_instrument_time_series_async(
-            args.instruments,
-            attributes,
-            **_ts_kwargs(args),
-        )
-        resp, warning = await _collect_all_pages(dq, resp, args.page)
-    _print_result_with_csv(
-        _with_warning(_timeseries_summary("Instrument time-series", resp), warning), resp, args.output_csv
+    return await _run_timeseries(
+        args,
+        "Instrument time-series",
+        lambda dq: dq.get_instrument_time_series_async(args.instruments, args.attributes, **_ts_kwargs(args)),
     )
-    return 1 if warning else 0
 
 
 async def cmd_expression_timeseries(args: argparse.Namespace) -> int:
-    async with DataQuery(args.env_file) as dq:
-        resp = await dq.get_expressions_time_series_async(
-            args.expressions,
-            **_ts_kwargs(args),
-        )
-        resp, warning = await _collect_all_pages(dq, resp, args.page)
-    _print_result_with_csv(
-        _with_warning(_timeseries_summary("Expression time-series", resp), warning), resp, args.output_csv
+    return await _run_timeseries(
+        args,
+        "Expression time-series",
+        lambda dq: dq.get_expressions_time_series_async(args.expressions, **_ts_kwargs(args)),
     )
-    return 1 if warning else 0
 
 
 async def cmd_grid_data(args: argparse.Namespace) -> int:
@@ -1229,8 +1225,7 @@ def cmd_mcp_install(args: argparse.Namespace) -> int:
     entry = mcp_install.server_entry(args.url)
     try:
         # Saved first: an entry without credentials behind it would fail on every launch.
-        env_file = EnvConfig.save_user_env({key: os.environ.get(f"{EnvConfig.PREFIX}{key}") for key in keys})
-        print(f"Saved {', '.join(f'{EnvConfig.PREFIX}{key}' for key in keys)} to {env_file} (owner-only)")
+        print(_save_user_env(keys))
         if args.config_file is not None:
             replaced = mcp_install.add_to_config_file(args.config_file, args.name, entry)
             print(f"{'Updated' if replaced else 'Added'} '{args.name}' in {args.config_file}")
@@ -1295,7 +1290,7 @@ def main_sync(ns: argparse.Namespace) -> int:
     return 0
 
 
-_ASYNC_COMMANDS = {
+_ASYNC_COMMANDS: dict[str, Callable[[argparse.Namespace], Coroutine[Any, Any, int]]] = {
     "groups": cmd_groups,
     "files": cmd_files,
     "availability": cmd_availability,
@@ -1348,6 +1343,7 @@ def _run(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
     if args.command == "auth" and not args.auth_command:
         _subcommand_parser(parser, "auth").print_help()
         return 1
+    # Looked up by name at call time (not via a table), so patching a cmd_* function takes effect.
     if args.command == "function-help":
         return cmd_function_help(args)
     if args.command == "mcp-install":
