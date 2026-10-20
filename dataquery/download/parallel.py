@@ -48,6 +48,7 @@ def _is_retryable(exc: BaseException) -> bool:
 
 
 def _check_partial_response(resp: aiohttp.ClientResponse, file_group_id: str, start_byte: int, end_byte: int) -> None:
+    """Raise ``RangeNotSupportedError`` unless ``resp`` is a 206 for exactly ``start_byte``-``end_byte``."""
     if resp.status != 206:
         raise RangeNotSupportedError(
             file_group_id, "", f"Expected 206 for bytes {start_byte}-{end_byte}, got HTTP {resp.status}"
@@ -60,6 +61,7 @@ def _check_partial_response(resp: aiohttp.ClientResponse, file_group_id: str, st
 
 
 def _discard_temp(temp_path: Path | None) -> None:
+    """Best-effort removal of a temp file; logs instead of raising."""
     if temp_path is None:
         return
     try:
@@ -78,6 +80,18 @@ def _preallocate_file(path: Path, size: int) -> None:
     """Sync truncate to ``size`` bytes; runs in the default thread executor."""
     with open(path, "wb", buffering=C.PREALLOC_BUFFER_SIZE) as f:
         f.truncate(size)
+
+
+async def _preallocate(path: Path, size: int) -> None:
+    """Preallocate in a worker thread; if cancelled, let the thread finish, then remove the file."""
+    work = asyncio.ensure_future(asyncio.to_thread(_preallocate_file, path, size))
+    try:
+        await asyncio.shield(work)
+    except asyncio.CancelledError:
+        with contextlib.suppress(Exception):
+            await work
+        _discard_temp(path)
+        raise
 
 
 def _compute_ranges(total_bytes: int, num_parts: int) -> list[tuple[int, int]]:
@@ -272,6 +286,7 @@ async def _download_all_ranges(ctx: _RangeContext, ranges: list[tuple[int, int]]
 
 
 def _make_throttler(max_bandwidth_mbps: float | None) -> BandwidthThrottler | None:
+    """Build a throttler from a Mbps limit; ``None`` or 0 means unlimited."""
     if not max_bandwidth_mbps:
         return None
     return BandwidthThrottler(max_bytes_per_second=int(max_bandwidth_mbps * C.MBPS_TO_BYTES_PER_SECOND))
@@ -349,7 +364,7 @@ async def download_file_multipart(
             raise FileExistsError(f"File already exists: {destination}")
 
         temp_destination = destination.with_suffix(destination.suffix + C.TEMP_SUFFIX)
-        await asyncio.to_thread(_preallocate_file, temp_destination, total_bytes)
+        await _preallocate(temp_destination, total_bytes)
 
         progress = DownloadProgress(
             file_group_id=file_group_id,
@@ -370,7 +385,7 @@ async def download_file_multipart(
             params=params,
             temp_path=temp_destination,
             chunk_size=options.chunk_size or C.DEFAULT_CHUNK_SIZE,
-            semaphore=asyncio.Semaphore(num_parts),
+            semaphore=asyncio.Semaphore(max(1, num_parts)),
             timeout=aiohttp.ClientTimeout(total=None, sock_read=client.config.timeout),
             throttler=_make_throttler(options.max_bandwidth_mbps),
             reporter=reporter,
@@ -466,7 +481,7 @@ async def download_file_parallel(
             raise FileExistsError(f"File already exists: {destination}")
 
         temp_destination = destination.with_suffix(destination.suffix + C.TEMP_SUFFIX)
-        await asyncio.to_thread(_preallocate_file, temp_destination, total_bytes)
+        await _preallocate(temp_destination, total_bytes)
 
         progress = DownloadProgress(
             file_group_id=file_group_id,

@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import builtins
 import inspect
+import threading
 import typing
 from collections import Counter
 from collections.abc import Callable
@@ -890,6 +891,49 @@ async def test_cancellation_removes_temp_file(tmp_path: Path, monkeypatch: pytes
     finally:
         gate.set()
         await drain_orphans()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entry", ["multipart", "parallel"])
+async def test_cancellation_during_preallocation_removes_temp_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entry: str
+) -> None:
+    """F9: a preallocation thread still running at cancel time used to recreate the .part file afterwards."""
+    started, release, done = threading.Event(), threading.Event(), threading.Event()
+    real_preallocate = parallel._preallocate_file
+
+    def slow_preallocate(path: Path, size: int) -> None:
+        started.set()
+        release.wait(5)
+        real_preallocate(path, size)
+        done.set()
+
+    monkeypatch.setattr(parallel, "_preallocate_file", slow_preallocate)
+    client = make_client(FakeServer(), monkeypatch, tmp_path)
+    task = asyncio.ensure_future(run_entry(entry, client, tmp_path / "out"))
+    await wait_until(started.is_set)
+    task.cancel()
+    timer = threading.Timer(0.05, release.set)
+    timer.start()
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await wait_until(done.is_set)
+        assert part_files(tmp_path) == []
+    finally:
+        release.set()
+        timer.join()
+
+
+@pytest.mark.asyncio
+async def test_multipart_with_zero_parts_still_completes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """F2: ``num_parts=0`` must not leave the range worker waiting on a zero-permit semaphore."""
+    server = FakeServer()
+    client = make_client(server, monkeypatch, tmp_path)
+    result = await asyncio.wait_for(multipart(client, tmp_path / "out", num_parts=0), timeout=5)
+    assert result.status is DownloadStatus.COMPLETED
+    assert result.local_path is not None
+    assert result.local_path.read_bytes() == _payload()
 
 
 @pytest.mark.asyncio
