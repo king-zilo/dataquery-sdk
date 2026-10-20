@@ -383,7 +383,6 @@ def test_grid_has_no_messages_key_when_server_sent_none() -> None:
 # --------------------------------------------------------------------------- #
 # Defects: each test describes the correct behaviour
 # --------------------------------------------------------------------------- #
-@pytest.mark.xfail(strict=True, reason="F1: `or` fallbacks write falsy values (0) as ''")
 def test_f1_falsy_values_are_kept() -> None:
     data = {
         "instruments": [
@@ -401,7 +400,6 @@ def test_f1_falsy_values_are_kept() -> None:
     assert _rows(grid["content"])[1] == ["0", "1"]
 
 
-@pytest.mark.xfail(strict=True, reason="F2: grid exporter drops the response-level errorMessage")
 @pytest.mark.parametrize(
     "payload",
     [
@@ -416,7 +414,6 @@ def test_f2_grid_response_error_is_reported(payload: Any) -> None:
     assert str(info.value) == "No grid series found in the response to export. Server error: [E1] Bad expr"
 
 
-@pytest.mark.xfail(strict=True, reason="F3: grid exporter drops per-series errorMessage")
 def test_f3_grid_series_errors_are_reported() -> None:
     payload = GridDataResponse.model_validate(
         {
@@ -433,7 +430,6 @@ def test_f3_grid_series_errors_are_reported() -> None:
     )
 
 
-@pytest.mark.xfail(strict=True, reason="F4: time-series exporter drops the 204 `info` message")
 @pytest.mark.parametrize("key", ["description", "message"])
 def test_f4_timeseries_info_is_reported(key: str) -> None:
     payload = TimeSeriesResponse.model_validate({"instruments": [], "info": {"code": 204, key: "No content available"}})
@@ -442,7 +438,6 @@ def test_f4_timeseries_info_is_reported(key: str) -> None:
     assert str(info.value) == "No instruments found in the response to export. Server info: [204] No content available"
 
 
-@pytest.mark.xfail(strict=True, reason="F5: non-dict entries raise AttributeError")
 def test_f5_non_dict_entries_are_skipped() -> None:
     good_attr = {"attribute-id": "A", "time-series": [["20240101", 1.0]]}
     data = {
@@ -461,7 +456,6 @@ def test_f5_non_dict_entries_are_skipped() -> None:
     assert grid["rows"] == 1
 
 
-@pytest.mark.xfail(strict=True, reason="F5: non-dict entries raise AttributeError")
 def test_f5_only_non_dict_entries_raise_dataquery_error() -> None:
     with pytest.raises(DataQueryError, match="^No instruments found"):
         export_timeseries_csv({"instruments": {"a": 1}}, "-")
@@ -471,7 +465,6 @@ def test_f5_only_non_dict_entries_raise_dataquery_error() -> None:
         export_grid_csv({"series": ["junk"]}, "-")
 
 
-@pytest.mark.xfail(strict=True, reason="F6: a record key `expression` clobbers the series expr")
 def test_f6_record_expression_does_not_clobber_series_expr() -> None:
     data = {"series": [{"expr": "SERIES", "records": [{"expression": "REC", "v": 1}, {"v": 2}]}]}
     assert _rows(export_grid_csv(data, "-")["content"]) == [
@@ -481,7 +474,6 @@ def test_f6_record_expression_does_not_clobber_series_expr() -> None:
     ]
 
 
-@pytest.mark.xfail(strict=True, reason="F7: server messages are dropped when other rows exist")
 def test_f7_timeseries_messages_are_returned_with_rows(tmp_path: Path) -> None:
     data = {
         "instruments": [
@@ -503,7 +495,6 @@ def test_f7_timeseries_messages_are_returned_with_rows(tmp_path: Path) -> None:
     assert export_timeseries_csv(data, "-")["messages"] == ["DB(B): Expression syntax error!"]
 
 
-@pytest.mark.xfail(strict=True, reason="F7: series errors are dropped when other rows exist")
 def test_f7_grid_errors_are_returned_with_rows() -> None:
     data = {
         "series": [
@@ -516,7 +507,6 @@ def test_f7_grid_errors_are_returned_with_rows() -> None:
     assert result["messages"] == ["Y: [E2] Invalid grid"]
 
 
-@pytest.mark.xfail(strict=True, reason="F8: missing parent directories are not created")
 def test_f8_missing_parent_directories_are_created(tmp_path: Path) -> None:
     ts_out = tmp_path / "a" / "b" / "ts.csv"
     grid_out = tmp_path / "c" / "grid.csv"
@@ -526,7 +516,6 @@ def test_f8_missing_parent_directories_are_created(tmp_path: Path) -> None:
     assert len(_read(grid_out)) == 4
 
 
-@pytest.mark.xfail(strict=True, reason="F9: UnicodeEncodeError escapes and truncates the existing file")
 @pytest.mark.parametrize("which", ["timeseries", "grid"])
 def test_f9_unencodable_value_raises_dataquery_error_and_keeps_file(tmp_path: Path, which: str) -> None:
     out = tmp_path / "out.csv"
