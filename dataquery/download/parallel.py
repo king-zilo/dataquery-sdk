@@ -88,8 +88,10 @@ async def _preallocate(path: Path, size: int) -> None:
     try:
         await asyncio.shield(work)
     except asyncio.CancelledError:
-        with contextlib.suppress(Exception):
-            await work
+        # The thread can't be interrupted; repeated cancels must not skip the cleanup below.
+        while not work.done():
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.wait({work})
         _discard_temp(path)
         raise
 

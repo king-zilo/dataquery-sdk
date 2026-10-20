@@ -894,9 +894,10 @@ async def test_cancellation_removes_temp_file(tmp_path: Path, monkeypatch: pytes
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cancels", [1, 2])
 @pytest.mark.parametrize("entry", ["multipart", "parallel"])
 async def test_cancellation_during_preallocation_removes_temp_file(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entry: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entry: str, cancels: int
 ) -> None:
     """F9: a preallocation thread still running at cancel time used to recreate the .part file afterwards."""
     started, release, done = threading.Event(), threading.Event(), threading.Event()
@@ -912,7 +913,9 @@ async def test_cancellation_during_preallocation_removes_temp_file(
     client = make_client(FakeServer(), monkeypatch, tmp_path)
     task = asyncio.ensure_future(run_entry(entry, client, tmp_path / "out"))
     await wait_until(started.is_set)
-    task.cancel()
+    for _ in range(cancels):
+        task.cancel()
+        await _REAL_SLEEP(0.01)
     timer = threading.Timer(0.05, release.set)
     timer.start()
     try:
