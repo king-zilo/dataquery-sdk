@@ -4,9 +4,10 @@ import asyncio
 import inspect
 import time
 from calendar import monthrange
+from collections.abc import Awaitable, Callable, Coroutine
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Literal, Optional, Tuple, TypeVar, Union
+from typing import Any, Literal, TypeVar
 
 import structlog
 from dotenv import load_dotenv
@@ -40,6 +41,13 @@ from .types.models import (
 logger = structlog.get_logger(__name__)
 
 P = TypeVar("P", bound=Paginated)
+T = TypeVar("T")
+
+_DEFAULT_RATE_LIMIT_CAPACITY: dict[str, Any] = {
+    "requests_per_minute": 1000,
+    "burst_capacity": 100,
+    "safe_interval": 0.1,
+}
 
 
 def _format_duration(seconds: float) -> str:
@@ -52,7 +60,7 @@ def _format_duration(seconds: float) -> str:
 class ConfigManager:
     """Configuration manager for DATAQUERY SDK."""
 
-    def __init__(self, env_file: Optional[Path] = None):
+    def __init__(self, env_file: Path | None = None):
         """Initialize ConfigManager."""
         self.env_file = env_file
 
@@ -72,6 +80,8 @@ class ConfigManager:
 class ProgressTracker:
     """Progress tracking for batch operations."""
 
+    __slots__ = ("log_interval", "last_log_time")
+
     def __init__(self, log_interval: int = 10):
         self.log_interval = log_interval
         self.last_log_time = 0.0
@@ -79,7 +89,7 @@ class ProgressTracker:
     def create_progress_callback(self) -> Callable:
         """Create a progress callback function."""
 
-        def progress_callback(progress: Any):
+        def progress_callback(progress: Any) -> None:
             current_time = time.time()
             if current_time - self.last_log_time >= self.log_interval:
                 logger.info(
@@ -120,7 +130,7 @@ class _SyncProxy:
         _sync_call.__doc__ = f"Synchronous wrapper for DataQuery.{async_name}."
         return _sync_call
 
-    def __dir__(self) -> List[str]:
+    def __dir__(self) -> list[str]:
         return [
             n[: -len("_async")]
             for n in dir(self._dq)
@@ -135,9 +145,9 @@ class DataQuery:
 
     def __init__(
         self,
-        config_or_env_file: Optional[Union[ClientConfig, str, Path]] = None,
-        client_id: Optional[str] = None,
-        client_secret: Optional[str] = None,
+        config_or_env_file: ClientConfig | str | Path | None = None,
+        client_id: str | None = None,
+        client_secret: str | None = None,
         **overrides: Any,
     ):
         """Initialize DataQuery with configuration."""
@@ -152,7 +162,7 @@ class DataQuery:
             config_manager = ConfigManager(env_file)
             config = config_manager.get_client_config()
 
-        updates: Dict[str, Any] = {}
+        updates: dict[str, Any] = {}
         if client_id or client_secret:
             if client_id and not isinstance(client_id, str):
                 raise ConfigurationError("client_id must be a string")
@@ -192,8 +202,8 @@ class DataQuery:
                 message = f"Configuration validation failed: {message}"
             raise ConfigurationError(message) from e
 
-        self._client: Optional[DataQueryClient] = None
-        self._sync_proxy: Optional[_SyncProxy] = None
+        self._client: DataQueryClient | None = None
+        self._sync_proxy: _SyncProxy | None = None
         self._sync_runner = SyncRunner()
 
     @property
@@ -233,6 +243,29 @@ class DataQuery:
             await self._client.close()
             self._client = None
 
+    def _default_download_options(self, destination_path: Path) -> DownloadOptions:
+        """Download options used when the caller gives only a destination path."""
+        return DownloadOptions(
+            destination_path=destination_path,
+            create_directories=True,
+            overwrite_existing=self.client_config.overwrite_existing,
+            chunk_size=8192,
+            max_retries=3,
+            retry_delay=1.0,
+            timeout=600.0,
+            enable_range_requests=True,
+            range_start=None,
+            range_end=None,
+            range_header=None,
+            show_progress=True,
+            progress_callback=None,
+        )
+
+    async def _connected_client(self) -> DataQueryClient:
+        """Connect if needed and return the client."""
+        await self.connect_async()
+        return self._ensure_client()
+
     def _ensure_client(self) -> "DataQueryClient":
         """Return the connected client or raise RuntimeError."""
         if self._client is None:
@@ -243,15 +276,13 @@ class DataQuery:
         """Cleanup resources and ensure proper shutdown."""
         await self.close_async()
 
-    def _run_sync(self, coro):
+    def _run_sync(self, coro: Coroutine[Any, Any, T]) -> T:
         """Run an async coroutine to completion and return its result."""
         return self._sync_runner.run(coro)
 
-    async def list_groups_async(self, limit: Optional[int] = 100) -> List[Group]:
+    async def list_groups_async(self, limit: int | None = 100) -> list[Group]:
         """List all available data groups with pagination support."""
-        await self.connect_async()
-
-        client = self._ensure_client()
+        client = await self._connected_client()
         if limit is None:
             return await client.list_all_groups_async()
         else:
@@ -259,57 +290,52 @@ class DataQuery:
 
     async def list_groups_page_async(
         self,
-        limit: Optional[int] = None,
+        limit: int | None = None,
         *,
-        page: Optional[str] = None,
+        page: str | None = None,
     ) -> GroupList:
         """Return a single page of groups for client-driven pagination."""
-        await self.connect_async()
-        client = self._ensure_client()
+        client = await self._connected_client()
         return await client.list_groups_page_async(limit=limit, page=page)
 
-    async def get_next_page_async(self, page: P) -> Optional[P]:
+    async def get_next_page_async(self, page: P) -> P | None:
         """Fetch the page after ``page``, or ``None`` if it is the last page."""
-        await self.connect_async()
-        client = self._ensure_client()
+        client = await self._connected_client()
         return await client.get_next_page_async(page)
 
     async def search_groups_async(
         self,
         keywords: str,
-        limit: Optional[int] = 100,
-        offset: Optional[int] = None,
+        limit: int | None = 100,
+        offset: int | None = None,
         *,
-        page: Optional[str] = None,
-    ) -> List[Group]:
+        page: str | None = None,
+    ) -> list[Group]:
         """Search groups by keywords (single page)."""
-        await self.connect_async()
-        client = self._ensure_client()
+        client = await self._connected_client()
         return await client.search_groups_async(keywords, limit, offset, page=page)
 
     async def search_groups_page_async(
         self,
         keywords: str,
-        limit: Optional[int] = None,
+        limit: int | None = None,
         *,
-        page: Optional[str] = None,
+        page: str | None = None,
     ) -> GroupList:
         """Return a single page of keyword search results for client-driven pagination."""
-        await self.connect_async()
-        client = self._ensure_client()
+        client = await self._connected_client()
         return await client.search_groups_page_async(keywords, limit=limit, page=page)
 
     async def search_all_groups_async(
         self,
         keywords: str,
         *,
-        limit: Optional[int] = None,
+        limit: int | None = None,
         max_pages: int = 1000,
         raise_on_cap: bool = True,
-    ) -> List[Group]:
+    ) -> list[Group]:
         """Walk every page of a keyword search via cursor pagination."""
-        await self.connect_async()
-        client = self._ensure_client()
+        client = await self._connected_client()
         return await client.search_all_groups_async(
             keywords, limit=limit, max_pages=max_pages, raise_on_cap=raise_on_cap
         )
@@ -318,133 +344,108 @@ class DataQuery:
         self,
         keywords: str,
         *,
-        limit: Optional[int] = None,
+        limit: int | None = None,
         max_pages: int = 1000,
     ):
         """Yield every :class:`Group` matching ``keywords`` across all pages."""
-        await self.connect_async()
-        client = self._ensure_client()
+        client = await self._connected_client()
         async for g in client.iter_search_groups_async(keywords, limit=limit, max_pages=max_pages):
             yield g
 
-    async def list_files_async(self, group_id: str, file_group_id: Optional[str] = None) -> List[FileInfo]:
+    async def list_files_async(self, group_id: str, file_group_id: str | None = None) -> list[FileInfo]:
         """List all files in a group, walking every page."""
-        await self.connect_async()
-        client = self._ensure_client()
+        client = await self._connected_client()
         return await client.list_all_files_async(group_id, file_group_id)
 
     async def list_files_page_async(
         self,
         group_id: str,
-        file_group_id: Optional[str] = None,
+        file_group_id: str | None = None,
         *,
-        page: Optional[str] = None,
+        page: str | None = None,
     ) -> FileList:
         """Return a single page of files for client-driven pagination."""
-        await self.connect_async()
-        client = self._ensure_client()
+        client = await self._connected_client()
         return await client.list_files_async(group_id, file_group_id, page=page)
 
     async def check_availability_async(self, file_group_id: str, file_datetime: str) -> AvailabilityInfo:
         """Check file availability for a specific datetime."""
-        await self.connect_async()
-        client = self._ensure_client()
+        client = await self._connected_client()
         return await client.check_availability_async(file_group_id, file_datetime)
 
     async def download_file_async(
         self,
         file_group_id: str,
-        file_datetime: Optional[str] = None,
-        destination_path: Optional[Path] = None,
-        options: Optional[DownloadOptions] = None,
+        file_datetime: str | None = None,
+        destination_path: Path | None = None,
+        options: DownloadOptions | None = None,
         num_parts: int = 1,
-        progress_callback: Optional[Callable] = None,
+        progress_callback: Callable | None = None,
     ) -> DownloadResult:
         """Download a specific file using parallel HTTP range requests."""
-        await self.connect_async()
+        client = await self._connected_client()
 
         if destination_path and options is not None:
             options = options.model_copy(update={"destination_path": Path(destination_path)})
         elif destination_path:
-            options = DownloadOptions(
-                destination_path=destination_path,
-                create_directories=True,
-                overwrite_existing=self.client_config.overwrite_existing,
-                chunk_size=8192,
-                max_retries=3,
-                retry_delay=1.0,
-                timeout=600.0,
-                enable_range_requests=True,
-                range_start=None,
-                range_end=None,
-                range_header=None,
-                show_progress=True,
-                progress_callback=None,
-            )
+            options = self._default_download_options(destination_path)
 
-        client = self._ensure_client()
         return await client.download_file_async(file_group_id, file_datetime, options, num_parts, progress_callback)
 
     async def list_available_files_async(
         self,
         group_id: str,
-        file_group_id: Optional[str] = None,
-        start_date: Optional[str] = None,
-        end_date: Optional[str] = None,
-    ) -> List[Dict[str, Any]]:
+        file_group_id: str | None = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
+    ) -> list[dict[str, Any]]:
         """List available files by date range."""
-        await self.connect_async()
-        client = self._ensure_client()
+        client = await self._connected_client()
         return await client.list_available_files_async(group_id, file_group_id, start_date, end_date)
 
     async def health_check_async(self) -> bool:
         """Check if the API is healthy."""
-        await self.connect_async()
-        client = self._ensure_client()
+        client = await self._connected_client()
         return await client.health_check_async()
 
-    async def service_status_async(self) -> Dict[str, Any]:
+    async def service_status_async(self) -> dict[str, Any]:
         """Heartbeat with the failure reason: ``{"up", "http_status", "error"}``."""
-        await self.connect_async()
-        client = self._ensure_client()
+        client = await self._connected_client()
         return await client.service_status_async()
 
     async def list_instruments_async(
         self,
         group_id: str,
-        instrument_id: Optional[str] = None,
-        page: Optional[str] = None,
+        instrument_id: str | None = None,
+        page: str | None = None,
     ) -> "InstrumentsResponse":
         """Request the complete list of instruments and identifiers for a given dataset."""
-        await self.connect_async()
-        client = self._ensure_client()
+        client = await self._connected_client()
         return await client.list_instruments_async(group_id, instrument_id, page)
 
     async def search_instruments_async(
-        self, group_id: str, keywords: str, page: Optional[str] = None
+        self, group_id: str, keywords: str, page: str | None = None
     ) -> "InstrumentsResponse":
         """Search within a dataset using keywords to create subsets of matching instruments."""
-        await self.connect_async()
-        client = self._ensure_client()
+        client = await self._connected_client()
         return await client.search_instruments_async(group_id, keywords, page)
 
     async def get_instrument_time_series_async(
         self,
-        instruments: List[str],
-        attributes: List[str],
+        instruments: list[str],
+        attributes: list[str],
         data: str = "ALL",
         format: str = "JSON",
-        start_date: Optional[str] = None,
-        end_date: Optional[str] = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
         calendar: str = "CAL_USBANK",
         frequency: str = "FREQ_DAY",
         conversion: str = "CONV_LASTBUS_ABS",
         nan_treatment: str = "NA_NOTHING",
-        page: Optional[str] = None,
+        page: str | None = None,
     ) -> "TimeSeriesResponse":
         """Retrieve time-series data for explicit list of instruments and attributes using identifiers."""
-        await self.connect_async()
-        client = self._ensure_client()
+        client = await self._connected_client()
         return await client.get_instrument_time_series_async(
             instruments,
             attributes,
@@ -461,20 +462,19 @@ class DataQuery:
 
     async def get_expressions_time_series_async(
         self,
-        expressions: List[str],
+        expressions: list[str],
         format: str = "JSON",
-        start_date: Optional[str] = None,
-        end_date: Optional[str] = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
         calendar: str = "CAL_USBANK",
         frequency: str = "FREQ_DAY",
         conversion: str = "CONV_LASTBUS_ABS",
         nan_treatment: str = "NA_NOTHING",
         data: str = "ALL",
-        page: Optional[str] = None,
+        page: str | None = None,
     ) -> "TimeSeriesResponse":
         """Retrieve time-series data using an explicit list of traditional DataQuery expressions."""
-        await self.connect_async()
-        client = self._ensure_client()
+        client = await self._connected_client()
         return await client.get_expressions_time_series_async(
             expressions,
             format,
@@ -488,41 +488,38 @@ class DataQuery:
             page,
         )
 
-    async def get_group_filters_async(self, group_id: str, page: Optional[str] = None) -> "FiltersResponse":
+    async def get_group_filters_async(self, group_id: str, page: str | None = None) -> "FiltersResponse":
         """Request the unique list of filter dimensions that are available for a given dataset."""
-        await self.connect_async()
-        client = self._ensure_client()
+        client = await self._connected_client()
         return await client.get_group_filters_async(group_id, page)
 
     async def get_group_attributes_async(
         self,
         group_id: str,
-        instrument_id: Optional[str] = None,
-        page: Optional[str] = None,
+        instrument_id: str | None = None,
+        page: str | None = None,
     ) -> "AttributesResponse":
         """Request the unique list of analytic attributes for each instrument of a given dataset."""
-        await self.connect_async()
-        client = self._ensure_client()
+        client = await self._connected_client()
         return await client.get_group_attributes_async(group_id, instrument_id, page)
 
     async def get_group_time_series_async(
         self,
         group_id: str,
-        attributes: List[str],
-        filter: Optional[str] = None,
+        attributes: list[str],
+        filter: str | None = None,
         data: str = "ALL",
         format: str = "JSON",
-        start_date: Optional[str] = None,
-        end_date: Optional[str] = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
         calendar: str = "CAL_USBANK",
         frequency: str = "FREQ_DAY",
         conversion: str = "CONV_LASTBUS_ABS",
         nan_treatment: str = "NA_NOTHING",
-        page: Optional[str] = None,
+        page: str | None = None,
     ) -> "TimeSeriesResponse":
         """Request time-series data across a subset of instruments and analytics of a given dataset."""
-        await self.connect_async()
-        client = self._ensure_client()
+        client = await self._connected_client()
         return await client.get_group_time_series_async(
             group_id,
             attributes,
@@ -540,19 +537,17 @@ class DataQuery:
 
     async def get_grid_data_async(
         self,
-        expr: Optional[str] = None,
-        grid_id: Optional[str] = None,
-        date: Optional[str] = None,
+        expr: str | None = None,
+        grid_id: str | None = None,
+        date: str | None = None,
     ) -> "GridDataResponse":
         """Retrieve grid data using an expression or a grid ID."""
-        await self.connect_async()
-        client = self._ensure_client()
+        client = await self._connected_client()
         return await client.get_grid_data_async(expr, grid_id, date)
 
-    async def search_async(self, query: str) -> Dict[str, Any]:
+    async def search_async(self, query: str) -> dict[str, Any]:
         """Search the DataQuery catalog using a natural-language query."""
-        await self.connect_async()
-        client = self._ensure_client()
+        client = await self._connected_client()
         return await client.search_async(query)
 
     async def run_groups_async(self, max_concurrent: int = 5) -> OperationReport:
@@ -602,7 +597,7 @@ class DataQuery:
                     error="No files found",
                 )
 
-            collected_types: List[str] = []
+            collected_types: list[str] = []
             for f in files:
                 ft = getattr(f, "file_type", None)
                 if isinstance(ft, list):
@@ -665,8 +660,8 @@ class DataQuery:
     async def run_download_async(
         self,
         file_group_id: str,
-        file_datetime: Optional[str] = None,
-        destination_path: Optional[Path] = None,
+        file_datetime: str | None = None,
+        destination_path: Path | None = None,
         max_concurrent: int = 1,
     ) -> OperationReport:
         """Run operation for downloading a single file."""
@@ -678,25 +673,7 @@ class DataQuery:
 
         try:
             logger.info("Step 1: Downloading File")
-            download_options = (
-                DownloadOptions(
-                    destination_path=destination_path,
-                    create_directories=True,
-                    overwrite_existing=self.client_config.overwrite_existing,
-                    chunk_size=8192,
-                    max_retries=3,
-                    retry_delay=1.0,
-                    timeout=600.0,
-                    enable_range_requests=True,
-                    range_start=None,
-                    range_end=None,
-                    range_header=None,
-                    show_progress=True,
-                    progress_callback=None,
-                )
-                if destination_path
-                else None
-            )
+            download_options = self._default_download_options(destination_path) if destination_path else None
             result = await self.download_file_async(file_group_id, file_datetime, destination_path, download_options)
 
             successful = result.status == DownloadStatus.COMPLETED
@@ -725,17 +702,17 @@ class DataQuery:
         group_id: str,
         start_date: str,
         end_date: str,
-        destination_dir: Union[str, Path] = Path("./downloads"),
+        destination_dir: str | Path = Path("./downloads"),
         max_concurrent: int = 5,
         num_parts: int = 1,
-        progress_callback: Optional[Callable] = None,
+        progress_callback: Callable | None = None,
         delay_between_downloads: float = 0.2,
         max_retries: int = 3,
-        file_group_id: Optional[Union[str, List[str]]] = None,
-        on_file_complete: Optional[Callable[["DownloadResult"], Awaitable[None]]] = None,
+        file_group_id: str | list[str] | None = None,
+        on_file_complete: Callable[["DownloadResult"], Awaitable[None]] | None = None,
     ) -> OperationReport:
         """Download all files in a group for a date range using parallel HTTP range requests."""
-        operation_start_time = time.time()
+        operation_start_time = time.monotonic()
 
         logger.info(
             "Starting group parallel download for date range",
@@ -748,8 +725,7 @@ class DataQuery:
             total_concurrency=max_concurrent * num_parts,
         )
 
-        await self.connect_async()
-        self._ensure_client()
+        await self._connected_client()
 
         try:
             logger.info("Step 1: Getting Available Files for Date Range")
@@ -762,18 +738,24 @@ class DataQuery:
                         end_date=end_date,
                     )
                 else:
-                    per_id_results = await asyncio.gather(
-                        *(
-                            self.list_available_files_async(
-                                group_id=group_id,
-                                file_group_id=fg,
-                                start_date=start_date,
-                                end_date=end_date,
-                            )
-                            for fg in id_list
-                        )
-                    )
-                    seen: set = set()
+                    try:
+                        async with asyncio.TaskGroup() as tg:
+                            tasks = [
+                                tg.create_task(
+                                    self.list_available_files_async(
+                                        group_id=group_id,
+                                        file_group_id=fg,
+                                        start_date=start_date,
+                                        end_date=end_date,
+                                    )
+                                )
+                                for fg in id_list
+                            ]
+                    except* Exception as eg:
+                        # Surface the first listing error itself, as asyncio.gather did.
+                        raise eg.exceptions[0] from None
+                    per_id_results = [t.result() for t in tasks]
+                    seen: set[tuple[Any, Any]] = set()
                     available_files = []
                     for batch in per_id_results:
                         for entry in batch or []:
@@ -803,7 +785,7 @@ class DataQuery:
                 filtered_files = []
 
             if not filtered_files:
-                operation_end_time = time.time()
+                operation_end_time = time.monotonic()
                 total_time_seconds = operation_end_time - operation_start_time
                 total_time_minutes = total_time_seconds / 60.0
 
@@ -833,7 +815,7 @@ class DataQuery:
 
             # Accept str as well as Path (the CLI passes --destination as a string).
             dest_dir = Path(destination_dir) / group_id
-            dest_dir.mkdir(parents=True, exist_ok=True)
+            await asyncio.to_thread(dest_dir.mkdir, parents=True, exist_ok=True)
 
             total_concurrent_requests = max_concurrent * num_parts
 
@@ -877,13 +859,13 @@ class DataQuery:
                 on_file_complete=on_file_complete,
             )
 
-            operation_end_time = time.time()
+            operation_end_time = time.monotonic()
             total_time_seconds = operation_end_time - operation_start_time
             total_time_minutes = total_time_seconds / 60.0
 
             recommendations = self._get_rate_limit_recommendations(total_concurrent_requests)
 
-            file_times: List[Dict[str, Any]] = []
+            file_times: list[dict[str, Any]] = []
             total_download_time = 0.0
             for result in successful:
                 if result.download_time:
@@ -898,7 +880,7 @@ class DataQuery:
                     total_download_time += result.download_time
 
             avg_file_time = total_download_time / len(successful) if successful else 0.0
-            file_time_values: List[float] = [float(ft["download_time_seconds"]) for ft in file_times]
+            file_time_values: list[float] = [float(ft["download_time_seconds"]) for ft in file_times]
             min_file_time = min(file_time_values) if file_time_values else 0.0
             max_file_time = max(file_time_values) if file_time_values else 0.0
 
@@ -977,12 +959,12 @@ class DataQuery:
             raise
 
     @staticmethod
-    def _split_into_monthly_ranges(from_date: str, to_date: str) -> List[Tuple[str, str]]:
+    def _split_into_monthly_ranges(from_date: str, to_date: str) -> list[tuple[str, str]]:
         """Split a date range into monthly chunks."""
         start = datetime.strptime(from_date, "%Y%m%d").date()
         end = datetime.strptime(to_date, "%Y%m%d").date()
 
-        ranges: List[Tuple[str, str]] = []
+        ranges: list[tuple[str, str]] = []
         current = start
 
         while current <= end:
@@ -1008,11 +990,11 @@ class DataQuery:
         num_parts: int = 1,
         delay_between_downloads: float = 0.2,
         max_retries: int = 3,
-        progress_callback: Optional[Callable] = None,
+        progress_callback: Callable | None = None,
         chunk_delay: float = 2.0,
     ) -> OperationReport:
         """Download files for a group across a large date range by splitting into monthly chunks."""
-        operation_start = time.time()
+        operation_start = time.monotonic()
 
         monthly_ranges = self._split_into_monthly_ranges(start_date, end_date)
 
@@ -1024,7 +1006,7 @@ class DataQuery:
             monthly_chunks=len(monthly_ranges),
         )
 
-        chunk_results: List[Dict[str, Any]] = []
+        chunk_results: list[dict[str, Any]] = []
         total_files = 0
         total_success = 0
         total_failed = 0
@@ -1036,7 +1018,7 @@ class DataQuery:
                 chunk_end=chunk_end,
             )
 
-            chunk_time = time.time()
+            chunk_time = time.monotonic()
             try:
                 chunk_report = await self.run_group_download_async(
                     group_id=group_id,
@@ -1050,7 +1032,7 @@ class DataQuery:
                     progress_callback=progress_callback,
                 )
 
-                chunk_elapsed = time.time() - chunk_time
+                chunk_elapsed = time.monotonic() - chunk_time
                 success = chunk_report.counts.get("successful_downloads", 0)
                 failed = chunk_report.counts.get("failed_downloads", 0)
                 files = chunk_report.counts.get("total_files", 0)
@@ -1081,7 +1063,7 @@ class DataQuery:
                 )
 
             except Exception as e:
-                chunk_elapsed = time.time() - chunk_time
+                chunk_elapsed = time.monotonic() - chunk_time
                 logger.error(
                     f"Chunk {i + 1}/{len(monthly_ranges)} failed",
                     chunk_start=chunk_start,
@@ -1101,12 +1083,12 @@ class DataQuery:
             if i < len(monthly_ranges) - 1:
                 await asyncio.sleep(chunk_delay)
 
-        total_elapsed = time.time() - operation_start
+        total_elapsed = time.monotonic() - operation_start
         total_minutes = total_elapsed / 60.0
 
         chunks_with_errors = [f"{c['start_date']}-{c['end_date']}" for c in chunk_results if "error" in c]
         status: Literal["success", "error", "partial"]
-        error: Optional[str] = None
+        error: str | None = None
         if total_files == 0 and not chunks_with_errors:
             status = "error"
             error = NO_FILES_FOUND_ERROR
@@ -1143,24 +1125,16 @@ class DataQuery:
         logger.info("Historical download completed", **summary.model_dump(exclude={"data"}))
         return summary
 
-    def _calculate_rate_limit_capacity(self) -> Dict[str, Any]:
+    def _calculate_rate_limit_capacity(self) -> dict[str, Any]:
         """Calculate the rate limit capacity without reducing concurrency."""
         if not self._client:
-            return {
-                "requests_per_minute": 1000,
-                "burst_capacity": 100,
-                "safe_interval": 0.1,
-            }
+            return dict(_DEFAULT_RATE_LIMIT_CAPACITY)
 
         try:
             rate_config = self._client.rate_limiter.config
 
             if not rate_config.enable_rate_limiting:
-                return {
-                    "requests_per_minute": 1000,
-                    "burst_capacity": 100,
-                    "safe_interval": 0.1,
-                }
+                return dict(_DEFAULT_RATE_LIMIT_CAPACITY)
 
             requests_per_minute = rate_config.requests_per_minute
             burst_capacity = rate_config.burst_capacity
@@ -1188,7 +1162,7 @@ class DataQuery:
     def _calculate_intelligent_delay(
         self,
         total_concurrent_requests: int,
-        rate_limit_capacity: Dict[str, Any],
+        rate_limit_capacity: dict[str, Any],
         base_delay: float,
     ) -> float:
         """Calculate intelligent delay that ensures rate limit compliance while maintaining concurrency."""
@@ -1298,7 +1272,7 @@ class DataQuery:
             )
             return max(1, min(10, requested_concurrency // 4))
 
-    def _get_rate_limit_recommendations(self, requested_concurrency: int) -> Dict[str, Any]:
+    def _get_rate_limit_recommendations(self, requested_concurrency: int) -> dict[str, Any]:
         """Get recommendations for optimizing rate limit settings for the requested concurrency."""
         if not self._client:
             return {}
@@ -1306,7 +1280,7 @@ class DataQuery:
         try:
             rate_config = self._client.rate_limiter.config
 
-            recommendations: Dict[str, Any] = {
+            recommendations: dict[str, Any] = {
                 "current_settings": {
                     "requests_per_minute": rate_config.requests_per_minute,
                     "burst_capacity": rate_config.burst_capacity,
@@ -1354,13 +1328,13 @@ class DataQuery:
             logger.warning("Failed to generate rate limit recommendations", error=str(e))
             return {}
 
-    def get_pool_stats(self) -> Dict[str, Any]:
+    def get_pool_stats(self) -> dict[str, Any]:
         """Get connection pool statistics including active, idle, and total connections."""
         if self._client:
             return self._client.get_pool_stats()
         return {"error": "Client not connected"}
 
-    def get_stats(self) -> Dict[str, Any]:
+    def get_stats(self) -> dict[str, Any]:
         """Get comprehensive client statistics."""
         if self._client:
             stats = self._client.get_stats()
@@ -1377,7 +1351,7 @@ class DataQuery:
         tracker = ProgressTracker(log_interval)
         return tracker.create_progress_callback()
 
-    def get_rate_limit_info(self) -> Dict[str, Any]:
+    def get_rate_limit_info(self) -> dict[str, Any]:
         """Get current rate limit configuration and status."""
         if not self._client:
             return {"error": "Client not connected"}
@@ -1407,7 +1381,7 @@ class DataQuery:
         except Exception as e:
             return {"error": f"Failed to get rate limit info: {e}"}
 
-    def optimize_concurrency_for_rate_limits(self, max_concurrent: int, num_parts: int) -> Dict[str, Any]:
+    def optimize_concurrency_for_rate_limits(self, max_concurrent: int, num_parts: int) -> dict[str, Any]:
         """Get optimized concurrency settings that respect rate limits."""
         requested_concurrency = max_concurrent * num_parts
         safe_concurrency = self._calculate_safe_concurrency_limit(requested_concurrency)
@@ -1454,35 +1428,35 @@ class DataQuery:
         finally:
             self._sync_runner.close()
 
-    def list_groups(self, limit: Optional[int] = 100) -> List[Group]:
+    def list_groups(self, limit: int | None = 100) -> list[Group]:
         """Synchronous wrapper for list_groups."""
         return self._run_sync(self.list_groups_async(limit))
 
-    def list_groups_page(self, limit: Optional[int] = None, *, page: Optional[str] = None) -> GroupList:
+    def list_groups_page(self, limit: int | None = None, *, page: str | None = None) -> GroupList:
         """Synchronous wrapper for list_groups_page_async (client-driven pagination)."""
         return self._run_sync(self.list_groups_page_async(limit=limit, page=page))
 
-    def get_next_page(self, page: P) -> Optional[P]:
+    def get_next_page(self, page: P) -> P | None:
         """Synchronous wrapper for get_next_page_async (fetch the next page, or None)."""
         return self._run_sync(self.get_next_page_async(page))
 
     def search_groups(
         self,
         keywords: str,
-        limit: Optional[int] = 100,
-        offset: Optional[int] = None,
+        limit: int | None = 100,
+        offset: int | None = None,
         *,
-        page: Optional[str] = None,
-    ) -> List[Group]:
+        page: str | None = None,
+    ) -> list[Group]:
         """Synchronous wrapper for search_groups (single page)."""
         return self._run_sync(self.search_groups_async(keywords, limit, offset, page=page))
 
     def search_groups_page(
         self,
         keywords: str,
-        limit: Optional[int] = None,
+        limit: int | None = None,
         *,
-        page: Optional[str] = None,
+        page: str | None = None,
     ) -> GroupList:
         """Synchronous wrapper for search_groups_page_async (client-driven pagination)."""
         return self._run_sync(self.search_groups_page_async(keywords, limit=limit, page=page))
@@ -1491,25 +1465,25 @@ class DataQuery:
         self,
         keywords: str,
         *,
-        limit: Optional[int] = None,
+        limit: int | None = None,
         max_pages: int = 1000,
         raise_on_cap: bool = True,
-    ) -> List[Group]:
+    ) -> list[Group]:
         """Synchronous wrapper for search_all_groups_async (cursor pagination)."""
         return self._run_sync(
             self.search_all_groups_async(keywords, limit=limit, max_pages=max_pages, raise_on_cap=raise_on_cap)
         )
 
-    def list_files(self, group_id: str, file_group_id: Optional[str] = None) -> List[FileInfo]:
+    def list_files(self, group_id: str, file_group_id: str | None = None) -> list[FileInfo]:
         """Synchronous wrapper for list_files."""
         return self._run_sync(self.list_files_async(group_id, file_group_id))
 
     def list_files_page(
         self,
         group_id: str,
-        file_group_id: Optional[str] = None,
+        file_group_id: str | None = None,
         *,
-        page: Optional[str] = None,
+        page: str | None = None,
     ) -> FileList:
         """Synchronous wrapper for list_files_page_async (client-driven pagination)."""
         return self._run_sync(self.list_files_page_async(group_id, file_group_id, page=page))
@@ -1521,11 +1495,11 @@ class DataQuery:
     def download_file(
         self,
         file_group_id: str,
-        file_datetime: Optional[str] = None,
-        destination_path: Optional[Path] = None,
-        options: Optional[DownloadOptions] = None,
+        file_datetime: str | None = None,
+        destination_path: Path | None = None,
+        options: DownloadOptions | None = None,
         num_parts: int = 1,
-        progress_callback: Optional[Callable] = None,
+        progress_callback: Callable | None = None,
     ) -> DownloadResult:
         """Synchronous wrapper for download_file."""
         return self._run_sync(
@@ -1542,10 +1516,10 @@ class DataQuery:
     def list_available_files(
         self,
         group_id: str,
-        file_group_id: Optional[str] = None,
-        start_date: Optional[str] = None,
-        end_date: Optional[str] = None,
-    ) -> List[Dict[str, Any]]:
+        file_group_id: str | None = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
+    ) -> list[dict[str, Any]]:
         """Synchronous wrapper for list_available_files."""
         return self._run_sync(self.list_available_files_async(group_id, file_group_id, start_date, end_date))
 
@@ -1553,36 +1527,36 @@ class DataQuery:
         """Synchronous wrapper for health_check."""
         return self._run_sync(self.health_check_async())
 
-    def service_status(self) -> Dict[str, Any]:
+    def service_status(self) -> dict[str, Any]:
         """Synchronous wrapper for service_status."""
         return self._run_sync(self.service_status_async())
 
     def list_instruments(
         self,
         group_id: str,
-        instrument_id: Optional[str] = None,
-        page: Optional[str] = None,
+        instrument_id: str | None = None,
+        page: str | None = None,
     ) -> "InstrumentsResponse":
         """Request the complete list of instruments and identifiers for a given dataset."""
         return self._run_sync(self.list_instruments_async(group_id, instrument_id, page))
 
-    def search_instruments(self, group_id: str, keywords: str, page: Optional[str] = None) -> "InstrumentsResponse":
+    def search_instruments(self, group_id: str, keywords: str, page: str | None = None) -> "InstrumentsResponse":
         """Search within a dataset using keywords to create subsets of matching instruments."""
         return self._run_sync(self.search_instruments_async(group_id, keywords, page))
 
     def get_instrument_time_series(
         self,
-        instruments: List[str],
-        attributes: List[str],
+        instruments: list[str],
+        attributes: list[str],
         data: str = "ALL",
         format: str = "JSON",
-        start_date: Optional[str] = None,
-        end_date: Optional[str] = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
         calendar: str = "CAL_USBANK",
         frequency: str = "FREQ_DAY",
         conversion: str = "CONV_LASTBUS_ABS",
         nan_treatment: str = "NA_NOTHING",
-        page: Optional[str] = None,
+        page: str | None = None,
     ) -> "TimeSeriesResponse":
         """Retrieve time-series data for explicit list of instruments and attributes using identifiers."""
         return self._run_sync(
@@ -1603,16 +1577,16 @@ class DataQuery:
 
     def get_expressions_time_series(
         self,
-        expressions: List[str],
+        expressions: list[str],
         format: str = "JSON",
-        start_date: Optional[str] = None,
-        end_date: Optional[str] = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
         calendar: str = "CAL_USBANK",
         frequency: str = "FREQ_DAY",
         conversion: str = "CONV_LASTBUS_ABS",
         nan_treatment: str = "NA_NOTHING",
         data: str = "ALL",
-        page: Optional[str] = None,
+        page: str | None = None,
     ) -> "TimeSeriesResponse":
         """Retrieve time-series data using an explicit list of traditional DataQuery expressions."""
         return self._run_sync(
@@ -1630,15 +1604,15 @@ class DataQuery:
             )
         )
 
-    def get_group_filters(self, group_id: str, page: Optional[str] = None) -> "FiltersResponse":
+    def get_group_filters(self, group_id: str, page: str | None = None) -> "FiltersResponse":
         """Request the unique list of filter dimensions that are available for a given dataset."""
         return self._run_sync(self.get_group_filters_async(group_id, page))
 
     def get_group_attributes(
         self,
         group_id: str,
-        instrument_id: Optional[str] = None,
-        page: Optional[str] = None,
+        instrument_id: str | None = None,
+        page: str | None = None,
     ) -> "AttributesResponse":
         """Request the unique list of analytic attributes for each instrument of a given dataset."""
         return self._run_sync(self.get_group_attributes_async(group_id, instrument_id, page))
@@ -1646,17 +1620,17 @@ class DataQuery:
     def get_group_time_series(
         self,
         group_id: str,
-        attributes: List[str],
-        filter: Optional[str] = None,
+        attributes: list[str],
+        filter: str | None = None,
         data: str = "ALL",
         format: str = "JSON",
-        start_date: Optional[str] = None,
-        end_date: Optional[str] = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
         calendar: str = "CAL_USBANK",
         frequency: str = "FREQ_DAY",
         conversion: str = "CONV_LASTBUS_ABS",
         nan_treatment: str = "NA_NOTHING",
-        page: Optional[str] = None,
+        page: str | None = None,
     ) -> "TimeSeriesResponse":
         """Request time-series data across a subset of instruments and analytics of a given dataset."""
         return self._run_sync(
@@ -1678,14 +1652,14 @@ class DataQuery:
 
     def get_grid_data(
         self,
-        expr: Optional[str] = None,
-        grid_id: Optional[str] = None,
-        date: Optional[str] = None,
+        expr: str | None = None,
+        grid_id: str | None = None,
+        date: str | None = None,
     ) -> "GridDataResponse":
         """Retrieve grid data using an expression or a grid ID."""
         return self._run_sync(self.get_grid_data_async(expr, grid_id, date))
 
-    def search(self, query: str) -> Dict[str, Any]:
+    def search(self, query: str) -> dict[str, Any]:
         """Synchronous wrapper for :meth:`search_async`."""
         return self._run_sync(self.search_async(query))
 
@@ -1704,8 +1678,8 @@ class DataQuery:
     def run_download(
         self,
         file_group_id: str,
-        file_datetime: Optional[str] = None,
-        destination_path: Optional[Path] = None,
+        file_datetime: str | None = None,
+        destination_path: Path | None = None,
         max_concurrent: int = 1,
     ) -> OperationReport:
         """Synchronous wrapper for run_download_async."""
@@ -1719,9 +1693,9 @@ class DataQuery:
         destination_dir: Path = Path("./downloads"),
         max_concurrent: int = 5,
         num_parts: int = 1,
-        progress_callback: Optional[Callable] = None,
+        progress_callback: Callable | None = None,
         delay_between_downloads: float = 1.0,
-        file_group_id: Optional[Union[str, List[str]]] = None,
+        file_group_id: str | list[str] | None = None,
     ) -> OperationReport:
         """Synchronous wrapper for run_group_download_async."""
         return self._run_sync(
@@ -1748,7 +1722,7 @@ class DataQuery:
         num_parts: int = 1,
         delay_between_downloads: float = 0.2,
         max_retries: int = 3,
-        progress_callback: Optional[Callable] = None,
+        progress_callback: Callable | None = None,
         chunk_delay: float = 2.0,
     ) -> OperationReport:
         """Synchronous wrapper for download_historical_async."""
@@ -1769,26 +1743,21 @@ class DataQuery:
 
     def cleanup(self):
         """Synchronous cleanup resources and ensure proper shutdown."""
-        try:
-            if self._client:
-                self._run_sync(self.close_async())
-                self._client = None
-        finally:
-            self._sync_runner.close()
+        self.close()
 
     async def auto_download_async(
         self,
         group_id: str,
         destination_dir: str = "./downloads",
-        file_filter: Optional[Callable] = None,
-        progress_callback: Optional[Callable] = None,
-        error_callback: Optional[Callable] = None,
+        file_filter: Callable | None = None,
+        progress_callback: Callable | None = None,
+        error_callback: Callable | None = None,
         max_retries: int = 3,
         max_concurrent_downloads: int = 5,
         initial_check: bool = True,
         reconnect_delay: float = 5.0,
         max_reconnect_delay: float = 60.0,
-        file_group_id: Optional[Union[str, List[str]]] = None,
+        file_group_id: str | list[str] | None = None,
         show_progress: bool = True,
         enable_event_replay: bool = True,
         heartbeat_timeout: float = 0.0,
@@ -1796,8 +1765,7 @@ class DataQuery:
         max_tracked_errors: int = 1_000,
     ):
         """Proxy to client's auto_download_async."""
-        await self.connect_async()
-        client = self._ensure_client()
+        client = await self._connected_client()
         return await client.auto_download_async(
             group_id=group_id,
             destination_dir=destination_dir,
@@ -1821,15 +1789,15 @@ class DataQuery:
         self,
         group_id: str,
         destination_dir: str = "./downloads",
-        file_filter: Optional[Callable] = None,
-        progress_callback: Optional[Callable] = None,
-        error_callback: Optional[Callable] = None,
+        file_filter: Callable | None = None,
+        progress_callback: Callable | None = None,
+        error_callback: Callable | None = None,
         max_retries: int = 3,
         max_concurrent_downloads: int = 5,
         initial_check: bool = True,
         reconnect_delay: float = 5.0,
         max_reconnect_delay: float = 60.0,
-        file_group_id: Optional[Union[str, List[str]]] = None,
+        file_group_id: str | list[str] | None = None,
         show_progress: bool = True,
         enable_event_replay: bool = True,
         heartbeat_timeout: float = 0.0,
@@ -1858,19 +1826,23 @@ class DataQuery:
             )
         )
 
+    def _dataframe_client(self) -> DataQueryClient:
+        """Return the client, creating an unconnected one for the offline dataframe helpers."""
+        if self._client is None:
+            self._client = DataQueryClient(self.client_config)
+        return self._client
+
     def to_dataframe(
         self,
         response_data,
         flatten_nested: bool = True,
         include_metadata: bool = False,
-        date_columns: Optional[List[str]] = None,
-        numeric_columns: Optional[List[str]] = None,
-        custom_transformations: Optional[Dict[str, Callable]] = None,
+        date_columns: list[str] | None = None,
+        numeric_columns: list[str] | None = None,
+        custom_transformations: dict[str, Callable] | None = None,
     ):
         """Proxy to client's to_dataframe utility."""
-        if self._client is None:
-            self._client = DataQueryClient(self.client_config)
-        return self._client.to_dataframe(
+        return self._dataframe_client().to_dataframe(
             response_data,
             flatten_nested=flatten_nested,
             include_metadata=include_metadata,
@@ -1880,21 +1852,13 @@ class DataQuery:
         )
 
     def groups_to_dataframe(self, groups, include_metadata: bool = False):
-        if self._client is None:
-            self._client = DataQueryClient(self.client_config)
-        return self._client.groups_to_dataframe(groups, include_metadata=include_metadata)
+        return self._dataframe_client().groups_to_dataframe(groups, include_metadata=include_metadata)
 
     def files_to_dataframe(self, files, include_metadata: bool = False):
-        if self._client is None:
-            self._client = DataQueryClient(self.client_config)
-        return self._client.files_to_dataframe(files, include_metadata=include_metadata)
+        return self._dataframe_client().files_to_dataframe(files, include_metadata=include_metadata)
 
     def instruments_to_dataframe(self, instruments, include_metadata: bool = False):
-        if self._client is None:
-            self._client = DataQueryClient(self.client_config)
-        return self._client.instruments_to_dataframe(instruments, include_metadata=include_metadata)
+        return self._dataframe_client().instruments_to_dataframe(instruments, include_metadata=include_metadata)
 
     def time_series_to_dataframe(self, time_series, include_metadata: bool = False):
-        if self._client is None:
-            self._client = DataQueryClient(self.client_config)
-        return self._client.time_series_to_dataframe(time_series, include_metadata=include_metadata)
+        return self._dataframe_client().time_series_to_dataframe(time_series, include_metadata=include_metadata)
