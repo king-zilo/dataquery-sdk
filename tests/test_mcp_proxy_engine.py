@@ -835,8 +835,7 @@ async def test_url_defaults_to_the_mcp_url_env_var(
 
 
 async def test_base_url_is_never_derived_from_the_mcp_url(fake: FakeMcp, proxy_env: dict[str, str]) -> None:
-    # get_env_var("BASE_URL") falls back to the model default, so the
-    # derivation branch in _build_oauth_manager never runs (see findings N3).
+    # The proxy never touches BASE_URL; ClientConfig's default applies (findings N3).
     oauth = mcp_proxy._build_oauth_manager(fake.mcp_url, None)
     assert "DATAQUERY_BASE_URL" not in os.environ
     assert oauth.config.base_url == ClientConfig.model_fields["base_url"].default

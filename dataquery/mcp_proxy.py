@@ -2,12 +2,10 @@
 
 import asyncio
 import json
-import os
 import sys
 from collections.abc import AsyncIterator, Callable, Coroutine
 from pathlib import Path
 from typing import Any, Final
-from urllib.parse import urlsplit
 
 import aiohttp
 import structlog
@@ -261,12 +259,12 @@ def _configure_stderr_logging() -> None:
 
 
 def _build_oauth_manager(url: str, env_file: Path | None) -> OAuthManager:
-    """Build the OAuth manager from env config."""
+    """Build the OAuth manager from env config.
+
+    ``url`` is unused; it is kept so the signature stays the same.
+    """
     if env_file is not None:
         EnvConfig.load_env_file(env_file)
-    if not EnvConfig.get_env_var("BASE_URL"):
-        parts = urlsplit(url)
-        os.environ[f"{EnvConfig.PREFIX}BASE_URL"] = f"{parts.scheme}://{parts.netloc}"
     config = EnvConfig.create_client_config()
     oauth = OAuthManager(config)
     if not oauth.is_authenticated():
