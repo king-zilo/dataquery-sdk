@@ -77,4 +77,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [1.3.2] - 2026-10-08
 ### Fixed
 - `dataquery auth test` prints `Authentication successful.` on success instead of exiting silently
-
+## [Unreleased]
+### Fixed
+- `dataquery auth test` and `dataquery config show` report configuration and authentication errors as `<message>` on stderr plus the JSON error envelope, exit 1, instead of a traceback
+- `dataquery config template --output` to an unwritable path reports the error and exits 1 instead of a traceback
+- A bare `dataquery config` or `dataquery auth` prints that command's help (exit 1); before, `config` printed nothing and `auth` printed the top-level help
+- `group-timeseries`, `instrument-timeseries`, `expression-timeseries` and `grid-data` print the result summary (including the server's error or an `INCOMPLETE` warning) before a failing `--output-csv` export's error
+- `mcp-connect` startup errors, including a missing `--env-file`, go to stderr only, so stdout (the MCP client's JSON-RPC channel) stays clean
+- Ctrl+C prints `Interrupted` to stderr and exits 130 instead of a `KeyboardInterrupt` traceback
+- `function-help --category` help lists the real registry categories (`Futures & Options`, not `F&O SPECIFIC`)
