@@ -834,11 +834,22 @@ async def test_url_defaults_to_the_mcp_url_env_var(
     assert len(fake.posts) == 1
 
 
-async def test_base_url_is_never_derived_from_the_mcp_url(fake: FakeMcp, proxy_env: dict[str, str]) -> None:
-    # The proxy never touches BASE_URL; ClientConfig's default applies (findings N3).
+async def test_unset_base_url_falls_back_to_the_default(fake: FakeMcp, proxy_env: dict[str, str]) -> None:
+    # get_env_var falls back to the model default when BASE_URL is unset, so
+    # the MCP-URL derivation only runs for an explicitly empty value.
     oauth = mcp_proxy._build_oauth_manager(fake.mcp_url, None)
     assert "DATAQUERY_BASE_URL" not in os.environ
     assert oauth.config.base_url == ClientConfig.model_fields["base_url"].default
+
+
+async def test_empty_base_url_is_derived_from_the_mcp_url(
+    fake: FakeMcp, proxy_env: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("DATAQUERY_BASE_URL", "")
+    oauth = mcp_proxy._build_oauth_manager(fake.mcp_url, None)
+    origin = fake.mcp_url.rsplit("/", 1)[0]
+    assert os.environ["DATAQUERY_BASE_URL"] == origin
+    assert oauth.config.base_url == origin
 
 
 async def test_env_file_supplies_the_configuration(
