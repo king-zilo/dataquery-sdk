@@ -1328,6 +1328,16 @@ def main() -> int:
         return 130
 
 
+def _report_error(args: argparse.Namespace, message: str, *, suggestion: str | None = None) -> None:
+    if args.command == "mcp-connect":
+        # stdout is the MCP client's JSON-RPC channel: keep errors on stderr.
+        print(message, file=sys.stderr)
+        if suggestion:
+            print(suggestion, file=sys.stderr)
+    else:
+        _print_error(message, suggestion=suggestion)
+
+
 def _run(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
     if not args.command:
         parser.print_help()
@@ -1335,7 +1345,7 @@ def _run(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
     if args.env_file and not Path(args.env_file).is_file():
         # The loader skips a missing file silently, which would quietly fall
         # back to other settings (e.g. ~/.dataquery/.env) for a mistyped path.
-        _print_error(f"--env-file not found: {args.env_file}")
+        _report_error(args, f"--env-file not found: {args.env_file}")
         return 1
     if args.command == "config" and not args.config_command:
         _subcommand_parser(parser, "config").print_help()
@@ -1362,14 +1372,7 @@ def _run(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
             return 1
         return asyncio.run(handler(args))
     except DataQueryError as exc:
-        suggestion = getattr(exc, "suggestion", None)
-        if args.command == "mcp-connect":
-            # stdout is the MCP client's JSON-RPC channel: keep errors on stderr.
-            print(str(exc), file=sys.stderr)
-            if suggestion:
-                print(suggestion, file=sys.stderr)
-        else:
-            _print_error(str(exc), suggestion=suggestion)
+        _report_error(args, str(exc), suggestion=getattr(exc, "suggestion", None))
         return 1
 
 

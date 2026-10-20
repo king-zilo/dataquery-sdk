@@ -1171,6 +1171,13 @@ def test_mcp_connect_startup_error_stays_off_stdout(run: Any) -> None:
     assert "Invalid float value for DATAQUERY_TIMEOUT: abc" in err
 
 
+def test_mcp_connect_missing_env_file_stays_off_stdout(run: Any, tmp_path: Path) -> None:
+    missing = tmp_path / "nope.env"
+    rc, out, err = run("--env-file", str(missing), "mcp-connect")
+    assert (rc, out) == (1, "")
+    assert err == f"--env-file not found: {missing}\n"
+
+
 def test_main_dispatches_mcp_install_and_skill_install(run: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(cli, "_mcp_extra_installed", lambda: False)
     rc, _, err = run("mcp-install")
