@@ -4,8 +4,9 @@ import asyncio
 import json
 import os
 import sys
+from collections.abc import AsyncIterator, Callable, Coroutine
 from pathlib import Path
-from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Optional
+from typing import Any, Final
 from urllib.parse import urlsplit
 
 import aiohttp
@@ -17,18 +18,20 @@ from .types.exceptions import AuthenticationError, ConfigurationError, NetworkEr
 
 logger = structlog.get_logger(__name__)
 
-_SESSION_HEADER = "Mcp-Session-Id"
-_PROTOCOL_HEADER = "MCP-Protocol-Version"
+_SESSION_HEADER: Final = "Mcp-Session-Id"
+_PROTOCOL_HEADER: Final = "MCP-Protocol-Version"
 
-_GET_BACKOFF_INITIAL = 1.0
-_GET_BACKOFF_MAX = 30.0
+_GET_BACKOFF_INITIAL: Final = 1.0
+_GET_BACKOFF_MAX: Final = 30.0
 
 # Longest stdin line accepted; longer lines are skipped.
-_STDIN_LIMIT = 64 * 1024 * 1024
+_STDIN_LIMIT: Final = 64 * 1024 * 1024
 # How long in-flight requests may run after stdin closes.
-_DRAIN_TIMEOUT = 30.0
+_DRAIN_TIMEOUT: Final = 30.0
 # How long the session DELETE may take on shutdown.
-_CLOSE_TIMEOUT = 5.0
+_CLOSE_TIMEOUT: Final = 5.0
+
+_TRANSPORT_ERROR_CODE: Final = -32001
 
 
 class StreamableHttpProxy:
@@ -39,16 +42,16 @@ class StreamableHttpProxy:
         url: str,
         oauth: OAuthManager,
         session: aiohttp.ClientSession,
-        emit: Callable[[Dict[str, Any]], None],
+        emit: Callable[[dict[str, Any]], None],
     ):
         self.url = url
         self.oauth = oauth
         self.session = session
         self.emit = emit
-        self.session_id: Optional[str] = None
-        self.protocol_version: Optional[str] = None
+        self.session_id: str | None = None
+        self.protocol_version: str | None = None
 
-    async def _headers(self) -> Dict[str, str]:
+    async def _headers(self) -> dict[str, str]:
         headers = await self.oauth.get_headers()
         headers["Accept"] = "application/json, text/event-stream"
         if self.session_id:
@@ -57,7 +60,7 @@ class StreamableHttpProxy:
             headers[_PROTOCOL_HEADER] = self.protocol_version
         return headers
 
-    async def handle_message(self, message: Dict[str, Any]) -> None:
+    async def handle_message(self, message: dict[str, Any]) -> None:
         """POST one client message to the endpoint and emit whatever comes back."""
         request_id = message.get("id")
         replied = False
@@ -65,8 +68,7 @@ class StreamableHttpProxy:
         def emit(payload: Any) -> None:
             nonlocal replied
             self._emit_message(payload)
-            if _is_reply(payload, request_id):
-                replied = True
+            replied = replied or _is_reply(payload, request_id)
 
         try:
             await self._post(message, emit)
@@ -74,13 +76,13 @@ class StreamableHttpProxy:
             # Whatever went wrong, a request must still get an answer.
             logger.error("MCP request failed", error=_describe(exc), replied=replied)
             if not replied:
-                if isinstance(exc, (json.JSONDecodeError, aiohttp.ContentTypeError)):
+                if isinstance(exc, json.JSONDecodeError | aiohttp.ContentTypeError):
                     text = "MCP endpoint returned a response that is not valid JSON"
                 else:
                     text = f"MCP request failed: {_describe(exc)}"
                 self._emit_transport_error(message, text)
 
-    async def _post(self, message: Dict[str, Any], emit: Callable[[Any], None]) -> None:
+    async def _post(self, message: dict[str, Any], emit: Callable[[Any], None]) -> None:
         for attempt in (1, 2):
             headers = await self._headers()
             headers["Content-Type"] = "application/json"
@@ -122,10 +124,8 @@ class StreamableHttpProxy:
                 if content_type.startswith("text/event-stream"):
                     async for payload in _sse_events(resp):
                         emit(payload)
-                else:
-                    payload = await resp.json(content_type=None)
-                    if payload is not None:
-                        emit(payload)
+                elif (payload := await resp.json(content_type=None)) is not None:
+                    emit(payload)
                 return
 
     def _capture_session(self, resp: aiohttp.ClientResponse) -> None:
@@ -141,7 +141,7 @@ class StreamableHttpProxy:
                 self.protocol_version = result["protocolVersion"]
         self.emit(payload)
 
-    def _emit_transport_error(self, request: Dict[str, Any], text: str) -> None:
+    def _emit_transport_error(self, request: dict[str, Any], text: str) -> None:
         """Answer a request the endpoint never processed with a JSON-RPC error."""
         request_id = request.get("id")
         if request_id is None:
@@ -150,7 +150,7 @@ class StreamableHttpProxy:
             {
                 "jsonrpc": "2.0",
                 "id": request_id,
-                "error": {"code": -32001, "message": text},
+                "error": {"code": _TRANSPORT_ERROR_CODE, "message": text},
             }
         )
 
@@ -184,14 +184,12 @@ class StreamableHttpProxy:
         if not self.session_id:
             return
         try:
-            await asyncio.wait_for(self._delete_session(), _CLOSE_TIMEOUT)
+            async with asyncio.timeout(_CLOSE_TIMEOUT):
+                headers = await self._headers()
+                async with self.session.delete(self.url, headers=headers) as resp:
+                    logger.debug("MCP session closed", status=resp.status)
         except Exception as exc:
             logger.debug("MCP session close failed", error=_describe(exc))
-
-    async def _delete_session(self) -> None:
-        headers = await self._headers()
-        async with self.session.delete(self.url, headers=headers) as resp:
-            logger.debug("MCP session closed", status=resp.status)
 
 
 def _is_reply(payload: Any, request_id: Any) -> bool:
@@ -208,33 +206,46 @@ def _describe(exc: BaseException) -> str:
     return str(exc) or type(exc).__name__
 
 
-async def _sse_events(resp: aiohttp.ClientResponse) -> AsyncIterator[Any]:
-    """Yield each JSON ``data:`` event of an SSE stream.
+class _SseDecoder:
+    """Incremental SSE parser: feed raw chunks, get back the JSON ``data:`` events.
 
     Lines are split from raw chunks so an event of any size gets through;
     aiohttp's line reader caps a line at its read buffer size.
     """
-    data_lines: list[str] = []
-    partial = bytearray()
-    async for chunk in resp.content.iter_any():
+
+    __slots__ = ("_data_lines", "_partial")
+
+    def __init__(self) -> None:
+        self._data_lines: list[str] = []
+        self._partial = bytearray()
+
+    def feed(self, chunk: bytes) -> list[Any]:
+        events: list[Any] = []
         start = 0
         while (end := chunk.find(b"\n", start)) >= 0:
-            partial += chunk[start:end]
+            self._partial += chunk[start:end]
             start = end + 1
-            line = partial.decode("utf-8", errors="replace").rstrip("\r")
-            partial.clear()
+            line = self._partial.decode("utf-8", errors="replace").rstrip("\r")
+            self._partial.clear()
             if line.startswith("data:"):
-                data_lines.append(line[5:].lstrip())
-            elif line == "" and data_lines:
-                data = "\n".join(data_lines)
-                data_lines = []
+                self._data_lines.append(line[5:].lstrip())
+            elif not line and self._data_lines:
+                data = "\n".join(self._data_lines)
+                self._data_lines.clear()
                 try:
-                    payload = json.loads(data)
+                    events.append(json.loads(data))
                 except json.JSONDecodeError:
                     logger.warning("Skipping non-JSON SSE event", data=data[:200])
-                    continue
-                yield payload
-        partial += chunk[start:]
+        self._partial += chunk[start:]
+        return events
+
+
+async def _sse_events(resp: aiohttp.ClientResponse) -> AsyncIterator[Any]:
+    """Yield each JSON ``data:`` event of an SSE response body."""
+    decoder = _SseDecoder()
+    async for chunk in resp.content.iter_any():
+        for payload in decoder.feed(chunk):
+            yield payload
 
 
 def _configure_stderr_logging() -> None:
@@ -249,7 +260,7 @@ def _configure_stderr_logging() -> None:
     )
 
 
-def _build_oauth_manager(url: str, env_file: Optional[Path]) -> OAuthManager:
+def _build_oauth_manager(url: str, env_file: Path | None) -> OAuthManager:
     """Build the OAuth manager from env config."""
     if env_file is not None:
         EnvConfig.load_env_file(env_file)
@@ -265,7 +276,7 @@ def _build_oauth_manager(url: str, env_file: Optional[Path]) -> OAuthManager:
     return oauth
 
 
-async def _read_stdin_lines() -> "asyncio.StreamReader":
+async def _read_stdin_lines() -> asyncio.StreamReader:
     loop = asyncio.get_running_loop()
     reader = asyncio.StreamReader(limit=_STDIN_LIMIT)
     protocol = asyncio.StreamReaderProtocol(reader)
@@ -280,14 +291,14 @@ async def _next_line(reader: asyncio.StreamReader) -> bytes:
         try:
             line = await reader.readuntil(b"\n")
         except asyncio.IncompleteReadError as exc:
-            line = exc.partial  # last line without a newline, or b"" at EOF
             if oversized:
                 return b""
+            return exc.partial  # last line without a newline, or b"" at EOF
         except asyncio.LimitOverrunError as exc:
             # Drop what is buffered of the line and keep reading to its end.
             if not oversized:
                 logger.warning("Skipping JSON-RPC line over the stdin limit")
-            oversized = True
+                oversized = True
             await reader.readexactly(exc.consumed)
             continue
         if not oversized:
@@ -295,12 +306,12 @@ async def _next_line(reader: asyncio.StreamReader) -> bytes:
         oversized = False
 
 
-def _emit_stdout(message: Dict[str, Any]) -> None:
+def _emit_stdout(message: dict[str, Any]) -> None:
     sys.stdout.write(json.dumps(message, separators=(",", ":")) + "\n")
     sys.stdout.flush()
 
 
-async def run_mcp_proxy(url: Optional[str] = None, env_file: Optional[Path] = None) -> int:
+async def run_mcp_proxy(url: str | None = None, env_file: Path | None = None) -> int:
     """Run the stdio <-> Streamable HTTP proxy until stdin closes.
 
     ``url`` defaults to ``DATAQUERY_MCP_URL``, and failing that to the PROD MCP
@@ -325,26 +336,23 @@ async def run_mcp_proxy(url: Optional[str] = None, env_file: Optional[Path] = No
         proxy = StreamableHttpProxy(url, oauth, session, _emit_stdout)
         logger.info("MCP proxy connected", url=url)
 
-        get_task: Optional[asyncio.Task] = None
-        pending: set[asyncio.Task] = set()
+        get_task: asyncio.Task[None] | None = None
+        pending: set[asyncio.Task[None]] = set()
 
-        def _done(task: asyncio.Task) -> None:
+        def _done(task: asyncio.Task[None]) -> None:
             pending.discard(task)
             error = None if task.cancelled() else task.exception()
             if error is not None:
                 logger.error("MCP proxy task failed", error=_describe(error))
 
-        def _track(coro: Awaitable[None]) -> None:
-            task = asyncio.ensure_future(coro)
-            pending.add(task)
+        def _spawn(coro: Coroutine[Any, Any, None]) -> asyncio.Task[None]:
+            task = asyncio.create_task(coro)
             task.add_done_callback(_done)
+            return task
 
         try:
             reader = await _read_stdin_lines()
-            while True:
-                line = await _next_line(reader)
-                if not line:
-                    break
+            while line := await _next_line(reader):
                 text = line.decode("utf-8", errors="replace").strip()
                 if not text:
                     continue
@@ -359,10 +367,9 @@ async def run_mcp_proxy(url: Optional[str] = None, env_file: Optional[Path] = No
                     continue
                 # Each message runs as its own task so a long streamed
                 # response doesn't block the next client message.
-                _track(proxy.handle_message(message))
+                pending.add(_spawn(proxy.handle_message(message)))
                 if get_task is None and message.get("method") == "notifications/initialized":
-                    get_task = asyncio.ensure_future(proxy.listen_get_stream())
-                    get_task.add_done_callback(_done)
+                    get_task = _spawn(proxy.listen_get_stream())
             if pending:
                 # stdin closed: let in-flight requests deliver their replies.
                 logger.info("stdin closed, waiting for in-flight requests", count=len(pending))
