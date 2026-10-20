@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import IO, TYPE_CHECKING, Awaitable, Callable, Optional
+from typing import IO, TYPE_CHECKING
 
 import aiohttp
 import structlog
@@ -57,7 +59,7 @@ def _check_partial_response(resp: aiohttp.ClientResponse, file_group_id: str, st
         )
 
 
-def _discard_temp(temp_path: Optional[Path]) -> None:
+def _discard_temp(temp_path: Path | None) -> None:
     if temp_path is None:
         return
     try:
@@ -95,33 +97,34 @@ def _compute_ranges(total_bytes: int, num_parts: int) -> list[tuple[int, int]]:
     return ranges
 
 
-@dataclass
+@dataclass(slots=True, frozen=True)
 class _ProbeResult:
     total_bytes: int
     filename: str
 
 
 async def _probe_size(
-    client: "DataQueryClient",
+    client: DataQueryClient,
     url: str,
-    params: dict,
+    params: dict[str, str],
     file_group_id: str,
-    file_datetime: Optional[str],
-    global_semaphore: asyncio.Semaphore,
-) -> Optional[_ProbeResult]:
-    """Issue a 1-byte range probe to learn file size and filename."""
-    async with global_semaphore:
+    file_datetime: str | None,
+    semaphore: asyncio.Semaphore | None,
+) -> _ProbeResult | None:
+    """Issue a 1-byte range probe; ``None`` means the file should be fetched single-stream."""
+    async with semaphore or contextlib.nullcontext():
         async with await client._enter_request_cm("GET", url, params=params, headers=C.PROBE_HEADERS) as probe_resp:
             await client._handle_response(probe_resp)
 
-            content_range = probe_resp.headers.get("Content-Range")
+            headers = probe_resp.headers
+            content_range = headers.get("Content-Range") or headers.get("content-range")
             if not (content_range and "/" in content_range):
                 return None
 
             try:
                 total_bytes = int(content_range.rsplit("/", 1)[1])
             except ValueError:
-                total_bytes = int(probe_resp.headers.get("Content-Length", "0"))
+                total_bytes = int(headers.get("Content-Length") or headers.get("content-length") or "0")
 
             if total_bytes <= 0 or total_bytes < C.SMALL_FILE_THRESHOLD:
                 return None
@@ -137,7 +140,7 @@ class _ProgressReporter:
         self,
         progress: DownloadProgress,
         total_bytes: int,
-        progress_callback: Optional[Callable],
+        progress_callback: Callable | None,
         show_progress: bool,
         file_group_id: str,
     ) -> None:
@@ -148,7 +151,7 @@ class _ProgressReporter:
         self._file_group_id = file_group_id
         self.bytes_downloaded = 0
         self._last_callback_bytes = 0
-        self._last_callback_time = time.time()
+        self._last_callback_time = time.monotonic()
 
     def add_bytes(self, n: int) -> None:
         self.bytes_downloaded += n
@@ -165,12 +168,12 @@ class _ProgressReporter:
         if not (
             self.bytes_downloaded - self._last_callback_bytes >= C.CALLBACK_BYTE_THRESHOLD
             or self.bytes_downloaded == self._total_bytes
-            or time.time() - self._last_callback_time >= C.CALLBACK_TIME_THRESHOLD
+            or time.monotonic() - self._last_callback_time >= C.CALLBACK_TIME_THRESHOLD
         ):
             return
 
         self._last_callback_bytes = self.bytes_downloaded
-        self._last_callback_time = time.time()
+        self._last_callback_time = time.monotonic()
         self._progress.update_progress(self.bytes_downloaded)
 
         if self._callback:
@@ -184,18 +187,18 @@ class _ProgressReporter:
             )
 
 
-@dataclass
+@dataclass(slots=True, frozen=True)
 class _RangeContext:
-    """Immutable shared state passed to every range worker."""
+    """Shared state passed to every range worker."""
 
-    client: "DataQueryClient"
+    client: DataQueryClient
     url: str
-    params: dict
+    params: dict[str, str]
     temp_path: Path
     chunk_size: int
     semaphore: asyncio.Semaphore
     timeout: aiohttp.ClientTimeout
-    throttler: Optional[BandwidthThrottler]
+    throttler: BandwidthThrottler | None
     reporter: _ProgressReporter
     max_retries: int
     retry_delay: float
@@ -203,9 +206,8 @@ class _RangeContext:
 
 async def _download_range(ctx: _RangeContext, start_byte: int, end_byte: int) -> None:
     """Download one byte range with retries, writing into the preallocated temp file."""
-    loop = asyncio.get_running_loop()
     range_headers = {"Range": f"bytes={start_byte}-{end_byte}"}
-    file_group_id = str(ctx.params.get("file-group-id", ""))
+    file_group_id = ctx.params.get("file-group-id", "")
     expected_bytes = end_byte - start_byte + 1
     part_bytes_written = 0
 
@@ -241,7 +243,7 @@ async def _download_range(ctx: _RangeContext, start_byte: int, end_byte: int) ->
                             if ctx.throttler:
                                 await ctx.throttler.throttle(chunk_len)
 
-                            await loop.run_in_executor(None, _seek_write, part_fh, current_pos, chunk)
+                            await asyncio.to_thread(_seek_write, part_fh, current_pos, chunk)
 
                             current_pos += chunk_len
                             part_bytes_written += chunk_len
@@ -269,21 +271,21 @@ async def _download_all_ranges(ctx: _RangeContext, ranges: list[tuple[int, int]]
         raise group.exceptions[0] from None
 
 
-def _make_throttler(max_bandwidth_mbps: Optional[float]) -> Optional[BandwidthThrottler]:
+def _make_throttler(max_bandwidth_mbps: float | None) -> BandwidthThrottler | None:
     if not max_bandwidth_mbps:
         return None
     return BandwidthThrottler(max_bytes_per_second=int(max_bandwidth_mbps * C.MBPS_TO_BYTES_PER_SECOND))
 
 
 def _salvage(
-    client: "DataQueryClient",
+    client: DataQueryClient,
     file_group_id: str,
-    destination: Optional[Path],
-    temp_destination: Optional[Path],
+    destination: Path | None,
+    temp_destination: Path | None,
     total_bytes: int,
     bytes_downloaded: int,
     start_time: float,
-) -> Optional[DownloadResult]:
+) -> DownloadResult | None:
     """Recover a partially-failed download."""
     try:
         if not (temp_destination and temp_destination.exists()):
@@ -311,58 +313,43 @@ def _salvage(
 
 
 async def download_file_multipart(
-    client: "DataQueryClient",
+    client: DataQueryClient,
     file_group_id: str,
-    file_datetime: Optional[str],
+    file_datetime: str | None,
     options: DownloadOptions,
     num_parts: int,
-    progress_callback: Optional[Callable] = None,
+    progress_callback: Callable | None = None,
 ) -> DownloadResult:
     """Download one file via parallel HTTP range requests into a preallocated temp file."""
-    params: dict = {"file-group-id": file_group_id}
+    params: dict[str, str] = {"file-group-id": file_group_id}
     if file_datetime:
         params["file-datetime"] = file_datetime
 
     start_time = time.time()
-    destination: Optional[Path] = None
-    temp_destination: Optional[Path] = None
-    total_bytes: int = 0
-    reporter: Optional[_ProgressReporter] = None
-    loop = asyncio.get_running_loop()
+    destination: Path | None = None
+    temp_destination: Path | None = None
+    total_bytes = 0
+    reporter: _ProgressReporter | None = None
 
     try:
         url = client._build_files_api_url(C.API_GROUP_FILE_DOWNLOAD)
 
-        async with await client._enter_request_cm("GET", url, params=params, headers=C.PROBE_HEADERS) as probe_resp:
-            await client._handle_response(probe_resp)
-            content_range = probe_resp.headers.get("content-range") or probe_resp.headers.get("Content-Range")
-            if not (content_range and "/" in content_range):
-                return await client._download_file_single_stream(
-                    file_group_id=file_group_id,
-                    file_datetime=file_datetime,
-                    options=options,
-                    progress_callback=progress_callback,
-                )
-            try:
-                total_bytes = int(content_range.split("/")[-1])
-            except ValueError:
-                total_bytes = int(probe_resp.headers.get("content-length", "0"))
+        probe = await _probe_size(client, url, params, file_group_id, file_datetime, None)
+        if probe is None:
+            return await client._download_file_single_stream(
+                file_group_id=file_group_id,
+                file_datetime=file_datetime,
+                options=options,
+                progress_callback=progress_callback,
+            )
+        total_bytes = probe.total_bytes
 
-            if total_bytes <= 0 or total_bytes < C.SMALL_FILE_THRESHOLD:
-                return await client._download_file_single_stream(
-                    file_group_id=file_group_id,
-                    file_datetime=file_datetime,
-                    options=options,
-                    progress_callback=progress_callback,
-                )
-
-            filename = get_filename_from_response(probe_resp, file_group_id, file_datetime)
-            destination = client._resolve_destination(options, file_group_id, filename)
-            if destination.exists() and not options.overwrite_existing:
-                raise FileExistsError(f"File already exists: {destination}")
+        destination = client._resolve_destination(options, file_group_id, probe.filename)
+        if destination.exists() and not options.overwrite_existing:
+            raise FileExistsError(f"File already exists: {destination}")
 
         temp_destination = destination.with_suffix(destination.suffix + C.TEMP_SUFFIX)
-        await loop.run_in_executor(None, _preallocate_file, temp_destination, total_bytes)
+        await asyncio.to_thread(_preallocate_file, temp_destination, total_bytes)
 
         progress = DownloadProgress(
             file_group_id=file_group_id,
@@ -424,14 +411,14 @@ async def download_file_multipart(
 
 
 async def download_file_parallel(
-    client: "DataQueryClient",
+    client: DataQueryClient,
     file_group_id: str,
-    file_datetime: Optional[str],
+    file_datetime: str | None,
     destination_path: Path,
     num_parts: int,
     global_semaphore: asyncio.Semaphore,
-    progress_callback: Optional[Callable] = None,
-) -> Optional[DownloadResult]:
+    progress_callback: Callable | None = None,
+) -> DownloadResult | None:
     """Download one file using parallel range requests under a shared semaphore."""
     if file_datetime:
         validate_file_datetime(file_datetime)
@@ -451,16 +438,15 @@ async def download_file_parallel(
             progress_callback=progress_callback,
         )
 
-    params: dict = {"file-group-id": file_group_id}
+    params: dict[str, str] = {"file-group-id": file_group_id}
     if file_datetime:
         params["file-datetime"] = file_datetime
 
     start_time = time.time()
-    destination: Optional[Path] = None
-    temp_destination: Optional[Path] = None
+    destination: Path | None = None
+    temp_destination: Path | None = None
     total_bytes = 0
-    reporter: Optional[_ProgressReporter] = None
-    loop = asyncio.get_running_loop()
+    reporter: _ProgressReporter | None = None
 
     try:
         url = client._build_files_api_url(C.DOWNLOAD_API_PATH)
@@ -480,7 +466,7 @@ async def download_file_parallel(
             raise FileExistsError(f"File already exists: {destination}")
 
         temp_destination = destination.with_suffix(destination.suffix + C.TEMP_SUFFIX)
-        await loop.run_in_executor(None, _preallocate_file, temp_destination, total_bytes)
+        await asyncio.to_thread(_preallocate_file, temp_destination, total_bytes)
 
         progress = DownloadProgress(
             file_group_id=file_group_id,
@@ -548,24 +534,24 @@ async def download_file_parallel(
         return None
 
 
-def _file_id(file_info: dict) -> Optional[str]:
+def _file_id(file_info: dict) -> str | None:
     return file_info.get("file-group-id", file_info.get("file_group_id"))
 
 
-def _file_dt(file_info: dict) -> Optional[str]:
+def _file_dt(file_info: dict) -> str | None:
     return file_info.get("file-datetime", file_info.get("file_datetime"))
 
 
 async def _download_one_with_stagger(
-    client: "DataQueryClient",
+    client: DataQueryClient,
     file_info: dict,
     destination_dir: Path,
     num_parts: int,
     global_semaphore: asyncio.Semaphore,
     delay_seconds: float,
-    progress_callback: Optional[Callable],
-    on_file_complete: Optional[Callable[[DownloadResult], Awaitable[None]]] = None,
-) -> Optional[DownloadResult]:
+    progress_callback: Callable | None,
+    on_file_complete: Callable[[DownloadResult], Awaitable[None]] | None = None,
+) -> DownloadResult | None:
     file_group_id = _file_id(file_info)
     file_datetime = _file_dt(file_info)
     if not file_group_id:
@@ -615,11 +601,11 @@ async def _download_one_with_stagger(
 
 def _classify(
     files: list[dict],
-    results: list,
+    results: list[DownloadResult | BaseException | None],
 ) -> tuple[list[DownloadResult], list[dict]]:
     succeeded: list[DownloadResult] = []
     failed: list[dict] = []
-    for file_info, result in zip(files, results):
+    for file_info, result in zip(files, results, strict=True):
         if isinstance(result, BaseException):
             failed.append({**file_info, "error": f"{type(result).__name__}: {result}"})
         elif (
@@ -637,7 +623,7 @@ def _classify(
 
 
 async def download_files_with_retry(
-    client: "DataQueryClient",
+    client: DataQueryClient,
     files: list[dict],
     destination_dir: Path,
     num_parts: int,
@@ -645,12 +631,12 @@ async def download_files_with_retry(
     intelligent_delay: float,
     base_retry_delay: float,
     max_retries: int,
-    progress_callback: Optional[Callable] = None,
-    on_file_complete: Optional[Callable[[DownloadResult], Awaitable[None]]] = None,
+    progress_callback: Callable | None = None,
+    on_file_complete: Callable[[DownloadResult], Awaitable[None]] | None = None,
 ) -> tuple[list[DownloadResult], list[dict], int]:
     """Run a staggered, retrying batch of parallel-range downloads."""
 
-    async def _launch(batch: list[dict]) -> list:
+    async def _launch(batch: list[dict]) -> list[DownloadResult | BaseException | None]:
         tasks = [
             _download_one_with_stagger(
                 client=client,
