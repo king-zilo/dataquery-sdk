@@ -937,9 +937,8 @@ async def test_logging_goes_to_stderr_only(capsys: pytest.CaptureFixture[str]) -
 
 
 # --------------------------------------------------------------------------- #
-# Defects (strict xfail until fixed)
+# Defects: fixed (F*) and not fixed (N*, strict xfail)
 # --------------------------------------------------------------------------- #
-@pytest.mark.xfail(strict=True, reason="F1: a non-object JSON line raises AttributeError and kills the proxy")
 @pytest.mark.parametrize("line", [b'[{"jsonrpc":"2.0","id":9,"method":"ping"}]\n', b"42\n", b'"text"\n', b"null\n"])
 async def test_non_object_line_is_skipped(
     start: Callable[..., Session], fake: FakeMcp, proxy_env: dict[str, str], line: bytes
@@ -952,7 +951,6 @@ async def test_non_object_line_is_skipped(
     assert [p["body"] for p in fake.posts] == [request(2)]
 
 
-@pytest.mark.xfail(strict=True, reason="F2: a non-JSON 2xx body escapes handle_message; the request is never answered")
 async def test_non_json_2xx_body_is_answered_with_an_error(make_proxy: Callable[..., Any], fake: FakeMcp) -> None:
     async def hook(req: web.Request, msg: Any) -> web.StreamResponse:
         return web.Response(text="<html>gateway</html>", content_type="text/html")
@@ -964,7 +962,6 @@ async def test_non_json_2xx_body_is_answered_with_an_error(make_proxy: Callable[
     assert len(emitted) == 1
 
 
-@pytest.mark.xfail(strict=True, reason="F2: a non-JSON 2xx body for a notification escapes handle_message")
 async def test_non_json_2xx_body_for_a_notification_is_logged_only(
     make_proxy: Callable[..., Any], fake: FakeMcp
 ) -> None:
@@ -977,7 +974,6 @@ async def test_non_json_2xx_body_for_a_notification_is_logged_only(
     assert emitted == []
 
 
-@pytest.mark.xfail(strict=True, reason="F3: a token failure mid-session escapes handle_message")
 async def test_token_failure_mid_session_is_answered(make_proxy: Callable[..., Any], fake: FakeMcp) -> None:
     proxy, emitted = make_proxy()
     await proxy.handle_message(initialize())
@@ -989,7 +985,6 @@ async def test_token_failure_mid_session_is_answered(make_proxy: Callable[..., A
     assert errors[0]["error"]["code"] == -32001
 
 
-@pytest.mark.xfail(strict=True, reason="F3: a token failure during the 401 refresh escapes handle_message")
 async def test_token_failure_during_401_refresh_is_answered(make_proxy: Callable[..., Any], fake: FakeMcp) -> None:
     proxy, emitted = make_proxy()
     await proxy.handle_message(initialize())
@@ -999,7 +994,6 @@ async def test_token_failure_during_401_refresh_is_answered(make_proxy: Callable
     assert len(errors_for(emitted, 2)) == 1
 
 
-@pytest.mark.xfail(strict=True, reason="F4: an SSE response dropped mid-stream escapes handle_message")
 async def test_dropped_sse_before_the_reply_is_answered(make_proxy: Callable[..., Any], fake: FakeMcp) -> None:
     async def hook(req: web.Request, msg: Any) -> web.StreamResponse:
         return await sse(req, [event({"jsonrpc": "2.0", "method": "progress"}), 'data: {"jsonrpc"'], drop=True)
@@ -1011,7 +1005,6 @@ async def test_dropped_sse_before_the_reply_is_answered(make_proxy: Callable[...
     assert len(errors_for(emitted, 4)) == 1
 
 
-@pytest.mark.xfail(strict=True, reason="F4: an SSE response dropped after its reply escapes handle_message")
 async def test_dropped_sse_after_the_reply_is_not_answered_twice(make_proxy: Callable[..., Any], fake: FakeMcp) -> None:
     async def hook(req: web.Request, msg: Any) -> web.StreamResponse:
         return await sse(req, [event(reply(msg["id"], done=True)), "data: {"], drop=True)
@@ -1022,7 +1015,6 @@ async def test_dropped_sse_after_the_reply_is_not_answered_twice(make_proxy: Cal
     assert emitted == [reply(4, done=True)]
 
 
-@pytest.mark.xfail(strict=True, reason="F5: an SSE event line over 512 KiB raises LineTooLong; the reply is lost")
 async def test_large_sse_event_is_delivered(make_proxy: Callable[..., Any], fake: FakeMcp) -> None:
     big = "x" * (2 * 1024 * 1024)
 
@@ -1035,7 +1027,6 @@ async def test_large_sse_event_is_delivered(make_proxy: Callable[..., Any], fake
     assert emitted == [reply(5, blob=big)]
 
 
-@pytest.mark.xfail(strict=True, reason="F6: a stdin line over the reader limit raises ValueError and kills the proxy")
 async def test_oversized_stdin_line_is_skipped(
     start: Callable[..., Session], fake: FakeMcp, proxy_env: dict[str, str]
 ) -> None:
@@ -1045,6 +1036,86 @@ async def test_oversized_stdin_line_is_skipped(
     await s.answered(2)
     assert await s.finish() == 0
     assert [p["body"]["id"] for p in fake.posts] == [2]
+
+
+async def test_oversized_last_line_at_eof_is_skipped(
+    start: Callable[..., Session], fake: FakeMcp, proxy_env: dict[str, str]
+) -> None:
+    s = start(limit=1024)
+    s.stdin.send(request(1))
+    await s.answered(1)
+    s.stdin.raw(json.dumps(request(2, "ping", blob="y" * 4096)).encode())  # no trailing newline
+    assert await s.finish() == 0
+    assert [p["body"]["id"] for p in fake.posts] == [1]
+
+
+async def test_oversized_line_arriving_in_pieces_is_skipped_once(
+    start: Callable[..., Session], fake: FakeMcp, proxy_env: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    log = RecordingLogger()
+    monkeypatch.setattr(mcp_proxy, "logger", log)
+    s = start(limit=1024)
+    line = (json.dumps(request(1, "ping", blob="y" * 8000)) + "\n").encode()
+    for i in range(0, len(line), 1500):
+        s.stdin.raw(line[i : i + 1500])
+        await _REAL_SLEEP(0.01)
+    s.stdin.send(request(2))
+    await s.answered(2)
+    assert await s.finish() == 0
+    assert [p["body"]["id"] for p in fake.posts] == [2]
+    assert [r for r in log.records if r[0] == "warning"] == [
+        ("warning", "Skipping JSON-RPC line over the stdin limit", {})
+    ]
+
+
+async def test_last_line_without_a_newline_is_processed(
+    start: Callable[..., Session], fake: FakeMcp, proxy_env: dict[str, str]
+) -> None:
+    s = start()
+    s.stdin.raw(json.dumps(request(1)).encode())
+    s.stdin.eof()
+    assert await asyncio.wait_for(s.task, 10) == 0
+    assert s.emitted == [reply(1, echo="ping")]
+
+
+class RecordingLogger:
+    def __init__(self) -> None:
+        self.records: list[tuple[str, str, dict[str, Any]]] = []
+
+    def __getattr__(self, level: str) -> Callable[..., None]:
+        def log(event: str, **kw: Any) -> None:
+            self.records.append((level, event, kw))
+
+        return log
+
+
+async def test_failed_background_task_is_logged(
+    start: Callable[..., Session], fake: FakeMcp, proxy_env: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def boom(self: StreamableHttpProxy) -> None:
+        raise RuntimeError("boom")
+
+    log = RecordingLogger()
+    monkeypatch.setattr(mcp_proxy, "logger", log)
+    monkeypatch.setattr(StreamableHttpProxy, "listen_get_stream", boom)
+    s = start()
+    s.stdin.send(INITIALIZED)
+    await wait_until(lambda: ("error", "MCP proxy task failed", {"error": "boom"}) in log.records)
+    assert await s.finish() == 0
+
+
+async def test_401_with_a_static_bearer_token_retries_once_without_a_token_fetch(
+    make_proxy: Callable[..., Any], fake: FakeMcp
+) -> None:
+    async def hook(req: web.Request, msg: Any) -> web.StreamResponse | None:
+        return web.Response(status=401) if len(fake.posts) == 1 else None
+
+    fake.post_hook = hook
+    proxy, emitted = make_proxy(bearer="static-token")
+    await proxy.handle_message(request(1))
+    assert [p["headers"]["Authorization"] for p in fake.posts] == ["Bearer static-token"] * 2
+    assert fake.token_calls == 0
+    assert emitted == [reply(1, echo="ping")]
 
 
 def _write_all(fd: int, data: bytes) -> None:
@@ -1058,7 +1129,6 @@ def _write_all(fd: int, data: bytes) -> None:
         os.close(fd)
 
 
-@pytest.mark.xfail(strict=True, reason="F6: _read_stdin_lines uses asyncio's 64 KiB default line limit")
 async def test_stdin_reader_accepts_large_lines(monkeypatch: pytest.MonkeyPatch) -> None:
     read_fd, write_fd = os.pipe()
     monkeypatch.setattr(sys, "stdin", os.fdopen(read_fd, "rb", buffering=0))
@@ -1076,7 +1146,6 @@ async def test_stdin_reader_accepts_large_lines(monkeypatch: pytest.MonkeyPatch)
         writer.join(5)
 
 
-@pytest.mark.xfail(strict=True, reason="F7: stdin EOF cancels in-flight requests, so their replies are lost")
 async def test_eof_lets_in_flight_requests_finish(
     start: Callable[..., Session], fake: FakeMcp, proxy_env: dict[str, str]
 ) -> None:
@@ -1090,7 +1159,6 @@ async def test_eof_lets_in_flight_requests_finish(
     assert s.emitted == [reply(1, echo="slow")]
 
 
-@pytest.mark.xfail(strict=True, reason="F8: each request rejected with the same stale token fetches its own new token")
 async def test_staggered_401s_share_one_refresh(make_proxy: Callable[..., Any], fake: FakeMcp) -> None:
     proxy, emitted = make_proxy()
     await proxy.handle_message(initialize())
@@ -1108,7 +1176,6 @@ async def test_staggered_401s_share_one_refresh(make_proxy: Callable[..., Any], 
     assert not any("error" in m for m in emitted)
 
 
-@pytest.mark.xfail(strict=True, reason="F9: close() has no timeout, so a stalled DELETE hangs shutdown")
 async def test_close_gives_up_on_a_stalled_delete(
     make_proxy: Callable[..., Any], fake: FakeMcp, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1120,7 +1187,6 @@ async def test_close_gives_up_on_a_stalled_delete(
     assert len(fake.deletes) == 1
 
 
-@pytest.mark.xfail(strict=True, reason="F10: an unreachable token endpoint at startup raises NetworkError")
 async def test_unreachable_token_endpoint_at_startup_exits_1(
     start: Callable[..., Session], proxy_env: dict[str, str], capsys: pytest.CaptureFixture[str]
 ) -> None:
