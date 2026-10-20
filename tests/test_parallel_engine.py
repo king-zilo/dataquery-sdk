@@ -362,13 +362,13 @@ def test_compute_ranges_is_contiguous_and_complete(total: int, parts: int) -> No
     assert sizes[:-1] == [total // parts] * (parts - 1)
 
 
-@pytest.mark.xfail(strict=True, reason="F2: returns [] when num_parts > total_bytes")
 def test_compute_ranges_caps_parts_at_byte_count() -> None:
+    """F2: more parts than bytes used to yield no ranges."""
     assert parallel._compute_ranges(3, 5) == [(0, 0), (1, 1), (2, 2)]
 
 
-@pytest.mark.xfail(strict=True, raises=ZeroDivisionError, reason="F2: num_parts=0 divides by zero")
 def test_compute_ranges_treats_zero_parts_as_one() -> None:
+    """F2: zero parts used to raise ZeroDivisionError."""
     assert parallel._compute_ranges(10, 0) == [(0, 9)]
 
 
@@ -716,12 +716,12 @@ async def test_batch_reports_generic_reason_when_parallel_fails(
 # --------------------------------------------------------------------------- #
 # Reliability defects (F1-F10, see PR findings table)
 # --------------------------------------------------------------------------- #
-@pytest.mark.xfail(strict=True, reason="F1: unknown size gives a 0-byte COMPLETED file")
 @pytest.mark.asyncio
 @pytest.mark.parametrize("entry", ["multipart", "parallel"])
 async def test_unknown_total_size_falls_back_to_single_stream(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entry: str
 ) -> None:
+    """F1: an unknown total size used to produce a 0-byte COMPLETED file."""
     server = FakeServer()
     server.on("probe", Reply(headers={"Content-Range": "bytes 0-0/*", "Content-Length": None}))
     client = make_client(server, monkeypatch, tmp_path)
@@ -730,9 +730,9 @@ async def test_unknown_total_size_falls_back_to_single_stream(
     assert (tmp_path / "out" / "FG.bin").read_bytes() == server.payload
 
 
-@pytest.mark.xfail(strict=True, reason="F3: a 200 reply (Range ignored) is written at every offset")
 @pytest.mark.asyncio
 async def test_part_answered_without_range_fails_cleanly(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """F3: a 200 reply (Range ignored) used to be written at every offset."""
     server = FakeServer(ignore_part_ranges=True)
     client = make_client(server, monkeypatch, tmp_path)
     result = await multipart(client, tmp_path / "out")
@@ -743,9 +743,9 @@ async def test_part_answered_without_range_fails_cleanly(tmp_path: Path, monkeyp
     assert all(server.part_attempts(s) <= 1 for s in (0, 100, 200, 300))
 
 
-@pytest.mark.xfail(strict=True, reason="F3: a 206 for a different range is accepted")
 @pytest.mark.asyncio
 async def test_part_with_mismatched_content_range_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """F3: a 206 for a different range used to be accepted."""
     server = FakeServer()
     server.on("part", *[Reply(headers={"Content-Range": f"bytes 0-99/{SIZE}"})] * 4, start=100)
     client = make_client(server, monkeypatch, tmp_path)
@@ -755,9 +755,9 @@ async def test_part_with_mismatched_content_range_fails(tmp_path: Path, monkeypa
     assert not (tmp_path / "out" / "FG.bin").exists()
 
 
-@pytest.mark.xfail(strict=True, reason="F4: a short part (clean EOF) leaves a zero-filled hole")
 @pytest.mark.asyncio
 async def test_short_part_is_retried(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """F4: a short part (clean EOF) used to leave a zero-filled hole."""
     server = FakeServer()
     server.on("part", Reply(truncate_to=40), start=100)
     client = make_client(server, monkeypatch, tmp_path)
@@ -768,9 +768,9 @@ async def test_short_part_is_retried(tmp_path: Path, monkeypatch: pytest.MonkeyP
     assert server.part_attempts(100) == 2
 
 
-@pytest.mark.xfail(strict=True, reason="F4: extra bytes overwrite the next range")
 @pytest.mark.asyncio
 async def test_oversized_part_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """F4: extra bytes used to overwrite the next range."""
     server = FakeServer()
     server.on("part", *[Reply(body=b"\xff" * 200)] * 4, start=0)
     client = make_client(server, monkeypatch, tmp_path)
@@ -780,10 +780,10 @@ async def test_oversized_part_is_rejected(tmp_path: Path, monkeypatch: pytest.Mo
     assert not (tmp_path / "out" / "FG.bin").exists()
 
 
-@pytest.mark.xfail(strict=True, reason="F5: a failed range leaves its siblings running")
 @pytest.mark.asyncio
 @pytest.mark.parametrize("entry", ["multipart", "parallel"])
 async def test_failed_range_cancels_siblings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entry: str) -> None:
+    """F5: a failed range used to leave its siblings running."""
     server = FakeServer()
     never = asyncio.Event()
     server.on("part", *[Reply(raise_before=aiohttp.ClientConnectionError("down"))] * 4, start=0)
@@ -802,9 +802,9 @@ async def test_failed_range_cancels_siblings(tmp_path: Path, monkeypatch: pytest
         await drain_orphans()
 
 
-@pytest.mark.xfail(strict=True, reason="F6: no backoff when a retry follows a pre-byte failure")
 @pytest.mark.asyncio
 async def test_pre_byte_failure_backs_off(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sleeps: list[float]) -> None:
+    """F6: a retry after a pre-byte failure used to skip the backoff."""
     server = FakeServer()
     server.on(
         "part",
@@ -818,12 +818,12 @@ async def test_pre_byte_failure_backs_off(tmp_path: Path, monkeypatch: pytest.Mo
     assert sleeps == [0.5, 1.0]
 
 
-@pytest.mark.xfail(strict=True, reason="F7: permanent 4xx errors are retried")
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status", [400, 401, 403, 404, 416])
 async def test_permanent_http_errors_are_not_retried(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sleeps: list[float], status: int
 ) -> None:
+    """F7: permanent 4xx errors used to be retried."""
     server = FakeServer()
     server.on("part", *[Reply(status=status)] * 4, start=100)
     client = make_client(server, monkeypatch, tmp_path)
@@ -834,9 +834,9 @@ async def test_permanent_http_errors_are_not_retried(
     assert sleeps == []
 
 
-@pytest.mark.xfail(strict=True, reason="F8: max_bandwidth_mbps is ignored by the multipart path")
 @pytest.mark.asyncio
 async def test_multipart_applies_bandwidth_limit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """F8: the multipart path used to ignore max_bandwidth_mbps."""
     created: list[_RecordingThrottler] = []
 
     class _RecordingThrottler(BandwidthThrottler):
@@ -857,10 +857,10 @@ async def test_multipart_applies_bandwidth_limit(tmp_path: Path, monkeypatch: py
     assert sum(created[0].calls) == SIZE
 
 
-@pytest.mark.xfail(strict=True, reason="F9: cancelling a download leaks the .part file")
 @pytest.mark.asyncio
 @pytest.mark.parametrize("entry", ["multipart", "parallel"])
 async def test_cancellation_removes_temp_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entry: str) -> None:
+    """F9: cancelling a download used to leak the .part file."""
     server = FakeServer()
     gate = asyncio.Event()
     for start in (0, 100, 200, 300):
@@ -884,9 +884,9 @@ async def test_cancellation_removes_temp_file(tmp_path: Path, monkeypatch: pytes
         await drain_orphans()
 
 
-@pytest.mark.xfail(strict=True, reason="F10: parts open a file handle before waiting for the semaphore")
 @pytest.mark.asyncio
 async def test_parts_open_files_only_inside_the_semaphore(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """F10: parts used to open a file handle before waiting for the semaphore."""
     state = {"open": 0, "peak": 0}
 
     class _Tracked:

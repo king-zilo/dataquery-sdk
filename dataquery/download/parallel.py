@@ -14,6 +14,7 @@ import structlog
 
 from .. import constants as C
 from ..core.client import get_filename_from_response, validate_file_datetime
+from ..types.exceptions import AuthenticationError, DownloadError, NotFoundError, ValidationError
 from ..types.models import (
     BandwidthThrottler,
     DownloadOptions,
@@ -27,6 +28,42 @@ if TYPE_CHECKING:
     from ..core.client import DataQueryClient
 
 logger = structlog.get_logger(__name__)
+
+
+class RangeNotSupportedError(DownloadError):
+    """The server did not answer a range request with the requested 206 slice."""
+
+
+class IncompleteRangeError(DownloadError):
+    """A range response carried fewer or more bytes than requested."""
+
+
+def _is_retryable(exc: BaseException) -> bool:
+    """Permanent client errors (4xx other than 408/429) are not worth retrying."""
+    if isinstance(exc, ValidationError) and exc.details.get("status_code") == 408:
+        return True
+    return not isinstance(exc, (AuthenticationError, NotFoundError, ValidationError, RangeNotSupportedError))
+
+
+def _check_partial_response(resp: aiohttp.ClientResponse, file_group_id: str, start_byte: int, end_byte: int) -> None:
+    if resp.status != 206:
+        raise RangeNotSupportedError(
+            file_group_id, "", f"Expected 206 for bytes {start_byte}-{end_byte}, got HTTP {resp.status}"
+        )
+    content_range = resp.headers.get("Content-Range")
+    if content_range and not content_range.startswith(f"bytes {start_byte}-{end_byte}/"):
+        raise RangeNotSupportedError(
+            file_group_id, "", f"Requested bytes {start_byte}-{end_byte}, got Content-Range {content_range!r}"
+        )
+
+
+def _discard_temp(temp_path: Optional[Path]) -> None:
+    if temp_path is None:
+        return
+    try:
+        temp_path.unlink(missing_ok=True)
+    except OSError as err:
+        logger.warning("Temp file cleanup failed", temp_path=str(temp_path), error=str(err))
 
 
 def _seek_write(fh: IO[bytes], pos: int, data: bytes) -> None:
@@ -43,6 +80,9 @@ def _preallocate_file(path: Path, size: int) -> None:
 
 def _compute_ranges(total_bytes: int, num_parts: int) -> list[tuple[int, int]]:
     """Split ``total_bytes`` into ``num_parts`` inclusive byte ranges."""
+    if total_bytes <= 0:
+        return []
+    num_parts = max(1, min(num_parts, total_bytes))
     part_size = total_bytes // num_parts
     ranges: list[tuple[int, int]] = []
     cursor = 0
@@ -83,7 +123,7 @@ async def _probe_size(
             except ValueError:
                 total_bytes = int(probe_resp.headers.get("Content-Length", "0"))
 
-            if total_bytes and total_bytes < C.SMALL_FILE_THRESHOLD:
+            if total_bytes <= 0 or total_bytes < C.SMALL_FILE_THRESHOLD:
                 return None
 
             filename = get_filename_from_response(probe_resp, file_group_id, file_datetime)
@@ -165,17 +205,20 @@ async def _download_range(ctx: _RangeContext, start_byte: int, end_byte: int) ->
     """Download one byte range with retries, writing into the preallocated temp file."""
     loop = asyncio.get_running_loop()
     range_headers = {"Range": f"bytes={start_byte}-{end_byte}"}
+    file_group_id = str(ctx.params.get("file-group-id", ""))
+    expected_bytes = end_byte - start_byte + 1
     part_bytes_written = 0
 
     for attempt in range(ctx.max_retries + 1):
         try:
-            if attempt > 0 and part_bytes_written > 0:
-                ctx.reporter.rewind(part_bytes_written)
-                part_bytes_written = 0
+            if attempt > 0:
+                if part_bytes_written:
+                    ctx.reporter.rewind(part_bytes_written)
+                    part_bytes_written = 0
                 await asyncio.sleep(ctx.retry_delay * (2 ** (attempt - 1)))
 
-            with open(ctx.temp_path, "r+b") as part_fh:
-                async with ctx.semaphore:
+            async with ctx.semaphore:
+                with open(ctx.temp_path, "r+b") as part_fh:
                     async with await ctx.client._enter_request_cm(
                         "GET",
                         ctx.url,
@@ -184,22 +227,52 @@ async def _download_range(ctx: _RangeContext, start_byte: int, end_byte: int) ->
                         timeout=ctx.timeout,
                     ) as resp:
                         await ctx.client._handle_response(resp)
+                        _check_partial_response(resp, file_group_id, start_byte, end_byte)
                         current_pos = start_byte
 
                         async for chunk in resp.content.iter_chunked(ctx.chunk_size):
+                            chunk_len = len(chunk)
+                            if part_bytes_written + chunk_len > expected_bytes:
+                                raise IncompleteRangeError(
+                                    file_group_id,
+                                    "",
+                                    f"Range {start_byte}-{end_byte} sent more than {expected_bytes} bytes",
+                                )
                             if ctx.throttler:
-                                await ctx.throttler.throttle(len(chunk))
+                                await ctx.throttler.throttle(chunk_len)
 
                             await loop.run_in_executor(None, _seek_write, part_fh, current_pos, chunk)
 
-                            chunk_len = len(chunk)
                             current_pos += chunk_len
                             part_bytes_written += chunk_len
                             ctx.reporter.add_bytes(chunk_len)
+
+                        if part_bytes_written != expected_bytes:
+                            raise IncompleteRangeError(
+                                file_group_id,
+                                "",
+                                f"Range {start_byte}-{end_byte} ended at {part_bytes_written}/{expected_bytes} bytes",
+                            )
             return
-        except Exception:
-            if attempt == ctx.max_retries:
+        except Exception as exc:
+            if attempt == ctx.max_retries or not _is_retryable(exc):
                 raise
+
+
+async def _download_all_ranges(ctx: _RangeContext, ranges: list[tuple[int, int]]) -> None:
+    """Run every range; the first failure cancels the rest and is re-raised as-is."""
+    try:
+        async with asyncio.TaskGroup() as tg:
+            for start_byte, end_byte in ranges:
+                tg.create_task(_download_range(ctx, start_byte, end_byte))
+    except BaseExceptionGroup as group:
+        raise group.exceptions[0] from None
+
+
+def _make_throttler(max_bandwidth_mbps: Optional[float]) -> Optional[BandwidthThrottler]:
+    if not max_bandwidth_mbps:
+        return None
+    return BandwidthThrottler(max_bytes_per_second=int(max_bandwidth_mbps * C.MBPS_TO_BYTES_PER_SECOND))
 
 
 def _salvage(
@@ -275,7 +348,7 @@ async def download_file_multipart(
             except ValueError:
                 total_bytes = int(probe_resp.headers.get("content-length", "0"))
 
-            if total_bytes and total_bytes < C.SMALL_FILE_THRESHOLD:
+            if total_bytes <= 0 or total_bytes < C.SMALL_FILE_THRESHOLD:
                 return await client._download_file_single_stream(
                     file_group_id=file_group_id,
                     file_datetime=file_datetime,
@@ -312,14 +385,14 @@ async def download_file_multipart(
             chunk_size=options.chunk_size or C.DEFAULT_CHUNK_SIZE,
             semaphore=asyncio.Semaphore(num_parts),
             timeout=aiohttp.ClientTimeout(total=None, sock_read=client.config.timeout),
-            throttler=None,
+            throttler=_make_throttler(options.max_bandwidth_mbps),
             reporter=reporter,
             max_retries=options.max_retries,
             retry_delay=options.retry_delay,
         )
 
         ranges = _compute_ranges(total_bytes, num_parts)
-        await asyncio.gather(*(_download_range(ctx, s, e) for s, e in ranges))
+        await _download_all_ranges(ctx, ranges)
         reporter.flush()
         temp_destination.replace(destination)
 
@@ -335,6 +408,9 @@ async def download_file_multipart(
         return client._create_download_result(
             file_group_id, destination, 0, 0, start_time, DownloadStatus.ALREADY_EXISTS, e
         )
+    except asyncio.CancelledError:
+        _discard_temp(temp_destination)
+        raise
     except Exception as e:
         bytes_downloaded = reporter.bytes_downloaded if reporter else 0
         salvaged = _salvage(
@@ -419,12 +495,6 @@ async def download_file_parallel(
             file_group_id=file_group_id,
         )
 
-        throttler: Optional[BandwidthThrottler] = None
-        if download_options.max_bandwidth_mbps:
-            throttler = BandwidthThrottler(
-                max_bytes_per_second=int(download_options.max_bandwidth_mbps * C.MBPS_TO_BYTES_PER_SECOND)
-            )
-
         ctx = _RangeContext(
             client=client,
             url=url,
@@ -433,14 +503,14 @@ async def download_file_parallel(
             chunk_size=download_options.chunk_size or C.DEFAULT_CHUNK_SIZE,
             semaphore=global_semaphore,
             timeout=aiohttp.ClientTimeout(total=None, sock_read=client.config.timeout),
-            throttler=throttler,
+            throttler=_make_throttler(download_options.max_bandwidth_mbps),
             reporter=reporter,
             max_retries=download_options.max_retries,
             retry_delay=download_options.retry_delay,
         )
 
         ranges = _compute_ranges(total_bytes, num_parts)
-        await asyncio.gather(*(_download_range(ctx, s, e) for s, e in ranges))
+        await _download_all_ranges(ctx, ranges)
         reporter.flush()
         temp_destination.replace(destination)
 
@@ -463,6 +533,9 @@ async def download_file_parallel(
             DownloadStatus.ALREADY_EXISTS,
             e,
         )
+    except asyncio.CancelledError:
+        _discard_temp(temp_destination)
+        raise
     except Exception as e:
         bytes_downloaded = reporter.bytes_downloaded if reporter else 0
         salvaged = _salvage(
