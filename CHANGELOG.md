@@ -12,7 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Group download capabilities with intelligent rate limiting
 - Comprehensive test suite with coverage reporting
 ## [0.0.8] - 2025-10-21
-- Made label and expression parameters optional in attribute api response 
+- Made label and expression parameters optional in attribute api response
 ## [0.0.9] - 2025-12-09
 - Performance optimizations
 ## [0.1.0] - 2025-12-10
@@ -20,11 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.1.1] - 2026-02-18
 - Non blocking IO
 ## [0.1.2] - 2026-02-18
-- File already exists status added 
+- File already exists status added
 ## [0.1.3] - 2026-02-21
-- Historical file download added 
+- Historical file download added
 ## [0.1.4] - 2026-03-23
-- Introduced circuit breaker environment variable (`DATAQUERY_CIRCUIT_BREAKER_THRESHOLD`) 
+- Introduced circuit breaker environment variable (`DATAQUERY_CIRCUIT_BREAKER_THRESHOLD`)
 ## [0.1.5] - 2026-04-16
 - Introduced file-group-id to the group downloads
 ## [0.2.0] - 2026-05-06
@@ -45,7 +45,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Group downloads: `run_group_download_async` accepts an `on_file_complete` async callback awaited per file on `completed`/`already_exists`
 - Extraction is Zip Slip-guarded, skips current-day archives, and surfaces failures via `extraction_errors` (downgrading overall status to `partial`); date windows with no available files no longer mark a multi-window run as `partial`
 ## [1.2.2] - 2026-07-18
-- MCP: new `mcp-connect` CLI command  
+- MCP: new `mcp-connect` CLI command
 ## [1.2.3] - 2026-07-23
 - Pagination: new client-driven `get_next_page_async(page)` helper — read `next_link` off any paged response and hand the page back to fetch the next one (manual counterpart to the SDK-driven `iter_pages`); next-page links are resolved against the surface the page came from and never sent off-host
 - Pagination models: `items`, `page-size`, and `info` fields, plus the `next_link` property and `get_self_link()` accessor, moved onto the shared `Paginated` mixin; `FileList` is now paginated; list fields default to empty instead of being required so partial/empty envelopes parse cleanly
@@ -78,3 +78,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - `dataquery auth test` prints `Authentication successful.` on success instead of exiting silently
 
+## [Unreleased]
+### Fixed
+- Parallel/multipart downloads (`download_file_parallel`, `download_file_multipart`): a server that ignores `Range` (HTTP 200) or returns a mismatched `Content-Range` now fails the download (`RangeNotSupportedError`) instead of writing a corrupt file marked completed
+- Range parts with too few bytes are retried and parts with too many are rejected, instead of leaving zero-filled gaps or overwriting neighbouring ranges
+- An unknown total size (`Content-Range: bytes 0-0/*`) now falls back to a single-stream download instead of producing a 0-byte completed file
+- A failed range cancels the remaining ranges; every retry backs off; permanent 4xx errors (except 408/429) are no longer retried
+- `max_bandwidth_mbps` is now applied to multipart downloads
+- Cancelling a download removes its `.part` temp file; part file handles are opened only after acquiring the concurrency semaphore
