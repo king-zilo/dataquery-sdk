@@ -12,7 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Group download capabilities with intelligent rate limiting
 - Comprehensive test suite with coverage reporting
 ## [0.0.8] - 2025-10-21
-- Made label and expression parameters optional in attribute api response 
+- Made label and expression parameters optional in attribute api response
 ## [0.0.9] - 2025-12-09
 - Performance optimizations
 ## [0.1.0] - 2025-12-10
@@ -20,11 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.1.1] - 2026-02-18
 - Non blocking IO
 ## [0.1.2] - 2026-02-18
-- File already exists status added 
+- File already exists status added
 ## [0.1.3] - 2026-02-21
-- Historical file download added 
+- Historical file download added
 ## [0.1.4] - 2026-03-23
-- Introduced circuit breaker environment variable (`DATAQUERY_CIRCUIT_BREAKER_THRESHOLD`) 
+- Introduced circuit breaker environment variable (`DATAQUERY_CIRCUIT_BREAKER_THRESHOLD`)
 ## [0.1.5] - 2026-04-16
 - Introduced file-group-id to the group downloads
 ## [0.2.0] - 2026-05-06
@@ -45,7 +45,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Group downloads: `run_group_download_async` accepts an `on_file_complete` async callback awaited per file on `completed`/`already_exists`
 - Extraction is Zip Slip-guarded, skips current-day archives, and surfaces failures via `extraction_errors` (downgrading overall status to `partial`); date windows with no available files no longer mark a multi-window run as `partial`
 ## [1.2.2] - 2026-07-18
-- MCP: new `mcp-connect` CLI command  
+- MCP: new `mcp-connect` CLI command
 ## [1.2.3] - 2026-07-23
 - Pagination: new client-driven `get_next_page_async(page)` helper — read `next_link` off any paged response and hand the page back to fetch the next one (manual counterpart to the SDK-driven `iter_pages`); next-page links are resolved against the surface the page came from and never sent off-host
 - Pagination models: `items`, `page-size`, and `info` fields, plus the `next_link` property and `get_self_link()` accessor, moved onto the shared `Paginated` mixin; `FileList` is now paginated; list fields default to empty instead of being required so partial/empty envelopes parse cleanly
@@ -78,3 +78,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - `dataquery auth test` prints `Authentication successful.` on success instead of exiting silently
 
+
+## [Unreleased]
+### Changed
+- `DataQuery.download_file_async(destination_path=...)` now honours `ClientConfig.overwrite_existing` (default `False`) instead of always overwriting, and applies `destination_path` onto a copy of `options` when both are given
+- `DataQuery.download_historical_async` returns `status="error"` with `NO_FILES_FOUND_ERROR` when no chunk found any files (including an empty date range) instead of `"success"`
+- `DataQuery(...)` keeps environment settings when only the credentials come from arguments; when no environment config can be built it falls back to `ClientConfig()` defaults
+- `DataQuery(...)` validates keyword overrides and credentials with pydantic on a copy: invalid values raise `ConfigurationError` naming the key, and the caller's `ClientConfig` is no longer mutated
+### Fixed
+- Burst-overflow download stagger no longer grows for small overflows; `optimize_concurrency_for_rate_limits` picks the largest safe `max_concurrent x num_parts` instead of collapsing to 1x1
+- `dq.sync.iter_search_groups` raises a clear `TypeError` (async generators have no sync form) and is no longer listed in `dir(dq.sync)`
