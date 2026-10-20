@@ -559,7 +559,6 @@ def test_no_environment_and_no_credentials_raises() -> None:
         DataQuery()
 
 
-@pytest.mark.xfail(strict=True, reason="D1: env settings are discarded when only the credentials are missing")
 def test_env_settings_survive_when_credentials_come_from_arguments(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("DATAQUERY_BASE_URL", "https://env.example.com")
     monkeypatch.setenv("DATAQUERY_TIMEOUT", "42")
@@ -568,39 +567,33 @@ def test_env_settings_survive_when_credentials_come_from_arguments(monkeypatch: 
     assert dq.client_config.timeout == 42.0
 
 
-@pytest.mark.xfail(strict=True, reason="D1: fallback is a placeholder host instead of the ClientConfig defaults")
 def test_fallback_without_base_url_uses_client_config_defaults() -> None:
     dq = DataQuery(client_id="cid", client_secret="sec")
     assert dq.client_config.base_url == ClientConfig().base_url
 
 
-@pytest.mark.xfail(strict=True, reason="D1: the error message is prefixed twice")
 def test_validation_error_message_is_prefixed_once() -> None:
     with pytest.raises(ConfigurationError) as exc:
         DataQuery()
     assert str(exc.value).count("Configuration validation failed") == 1
 
 
-@pytest.mark.xfail(strict=True, reason="D2: overrides bypass pydantic coercion")
 def test_override_is_coerced_to_the_field_type() -> None:
     dq = DataQuery(_cfg(), timeout="30")
     assert dq.client_config.timeout == 30.0
 
 
-@pytest.mark.xfail(strict=True, reason="D2: invalid override values are not rejected by key")
 @pytest.mark.parametrize("key, value", [("timeout", "abc"), ("max_retries", 2.5), ("oauth_enabled", "maybe")])
 def test_invalid_override_raises_naming_the_key(key: str, value: Any) -> None:
     with pytest.raises(ConfigurationError, match=key):
         DataQuery(_cfg(), **{key: value})
 
 
-@pytest.mark.xfail(strict=True, reason="D2: overrides skip field validators")
 def test_override_runs_field_validators() -> None:
     dq = DataQuery(_cfg(), base_url="https://other.example.com/")
     assert dq.client_config.base_url == "https://other.example.com"
 
 
-@pytest.mark.xfail(strict=True, reason="D3: overrides and credentials mutate the caller's ClientConfig")
 def test_caller_config_is_not_mutated() -> None:
     cfg = _cfg(bearer_token=None, oauth_token_url=None)
     DataQuery(cfg, client_id="cid", client_secret="sec", timeout=5.0)
@@ -703,7 +696,6 @@ def test_sync_method_inside_running_loop_raises() -> None:
     dq.close()
 
 
-@pytest.mark.xfail(strict=True, reason="D8: async generators are exposed on .sync and fail with a confusing error")
 def test_sync_proxy_does_not_offer_async_generators() -> None:
     dq = DataQuery(_cfg())
     try:
@@ -885,7 +877,6 @@ async def test_download_file_builds_options_from_destination() -> None:
     assert opts.enable_range_requests is True and opts.show_progress is True
 
 
-@pytest.mark.xfail(strict=True, reason="D4: destination_path forces overwrite_existing=True")
 @pytest.mark.asyncio
 async def test_download_file_respects_configured_overwrite() -> None:
     dq, client = _facade()
@@ -894,7 +885,6 @@ async def test_download_file_respects_configured_overwrite() -> None:
     assert _last_call(client.download_file_async).args[2].overwrite_existing is False
 
 
-@pytest.mark.xfail(strict=True, reason="D4: destination_path is ignored when options are given")
 @pytest.mark.asyncio
 async def test_download_file_applies_destination_onto_options() -> None:
     dq, client = _facade()
@@ -1166,7 +1156,6 @@ async def test_historical_error_when_nothing_succeeded(monkeypatch: pytest.Monke
     assert report.status == "error" and report.counts["failed_downloads"] == 2
 
 
-@pytest.mark.xfail(strict=True, reason="D5: a historical download that found no files reports success")
 @pytest.mark.asyncio
 async def test_historical_without_files_is_an_error(monkeypatch: pytest.MonkeyPatch) -> None:
     dq, _ = _facade()
@@ -1176,7 +1165,6 @@ async def test_historical_without_files_is_an_error(monkeypatch: pytest.MonkeyPa
     assert report.status == "error" and report.error == NO_FILES_FOUND_ERROR
 
 
-@pytest.mark.xfail(strict=True, reason="D5: an empty (reversed) date range reports success")
 @pytest.mark.asyncio
 async def test_historical_reversed_range_is_an_error() -> None:
     dq, _ = _facade()
@@ -1228,7 +1216,6 @@ def test_intelligent_delay_bad_capacity_returns_base() -> None:
     assert dq._calculate_intelligent_delay(10, {}, 0.7) == 0.7
 
 
-@pytest.mark.xfail(strict=True, reason="D6: a small burst overflow gets a larger stagger than a large one")
 def test_intelligent_delay_is_monotonic_in_overflow() -> None:
     dq = DataQuery(_cfg())
     delays = [dq._calculate_intelligent_delay(n, CAP, 0.2) for n in (5, 6, 10, 30, 105)]
@@ -1283,7 +1270,6 @@ def test_optimize_concurrency_single_axis(mc: int, parts: int, expected: tuple[i
     assert result["rate_limit_applied"] is True and result["safe_limit"] == 5
 
 
-@pytest.mark.xfail(strict=True, reason="D7: proportional flooring shrinks 6x6 and 3x3 to 1x1")
 @pytest.mark.parametrize("mc, parts, expected", [(6, 6, (5, 1)), (3, 3, (2, 2))])
 def test_optimize_concurrency_uses_the_safe_budget(mc: int, parts: int, expected: tuple[int, int]) -> None:
     dq = DataQuery(_cfg())
@@ -1320,3 +1306,9 @@ def test_progress_tracker_logs_at_most_once_per_interval(monkeypatch: pytest.Mon
         {"completed": 0, "total": 0, "percentage": "0.0%", "current_file": "unknown"},
     ]
     assert ProgressTracker().log_interval == 10
+
+
+def test_unreadable_environment_falls_back_to_client_config_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DATAQUERY_BASE_URL", "https://env.example.com")
+    monkeypatch.setenv("DATAQUERY_TIMEOUT", "not-a-number")
+    assert ConfigManager().get_client_config() == ClientConfig()

@@ -130,10 +130,7 @@ class TestConfigManager:
         config = config_manager._get_default_config()
 
         assert isinstance(config, ClientConfig)
-        assert config.base_url == "https://api.dataquery.com"
-        assert config.oauth_enabled is False
-        # The bearer_token might be None in the actual implementation
-        assert config.get_bearer_token() in [None, "your_bearer_token_here"]
+        assert config == ClientConfig()
 
 
 class TestProgressTracker:
@@ -469,8 +466,9 @@ class TestDataQueryAsyncMethods:
                 result = await dataquery.download_file_async("file1", "20200101", Path("./downloads"), options)
 
                 assert result == mock_result
-                # Fix: The actual method signature is different - destination_path is passed separately
-                mock_client.download_file_async.assert_called_once_with("file1", "20200101", options, 1, None)
+                expected = options.model_copy(update={"destination_path": Path("./downloads")})
+                mock_client.download_file_async.assert_called_once_with("file1", "20200101", expected, 1, None)
+                assert options.destination_path is None
 
     @pytest.mark.asyncio
     async def test_list_available_files_async(self):

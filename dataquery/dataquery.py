@@ -1,6 +1,7 @@
 """Main DataQuery class for the DATAQUERY SDK."""
 
 import asyncio
+import inspect
 import time
 from calendar import monthrange
 from datetime import date, datetime
@@ -10,6 +11,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Literal, Optional, Tupl
 import structlog
 from dotenv import load_dotenv
 from pydantic import SecretStr
+from pydantic import ValidationError as PydanticValidationError
 
 from .config import EnvConfig
 from .constants.download import NO_FILES_FOUND_ERROR
@@ -57,19 +59,14 @@ class ConfigManager:
     def get_client_config(self) -> ClientConfig:
         """Get client configuration from environment variables."""
         try:
-            config = EnvConfig.create_client_config(env_file=self.env_file)
-            EnvConfig.validate_config(config)
-            return config
+            return EnvConfig.create_client_config(env_file=self.env_file)
         except ConfigurationError as e:
-            logger.warning("Configuration validation failed, using defaults", error=str(e))
+            logger.warning("Environment configuration unavailable, using defaults", error=str(e))
             return self._get_default_config()
 
     def _get_default_config(self) -> ClientConfig:
-        """Get default configuration for examples."""
-        return ClientConfig(
-            base_url="https://api.dataquery.com",
-            oauth_enabled=False,
-        )
+        """Get the default configuration used when the environment cannot provide one."""
+        return ClientConfig()
 
 
 class ProgressTracker:
@@ -110,6 +107,11 @@ class _SyncProxy:
         target = getattr(self._dq, async_name, None)
         if target is None or not callable(target):
             raise AttributeError(f"DataQuery has no async method '{async_name}'")
+        if inspect.isasyncgenfunction(target):
+            raise TypeError(
+                f"DataQuery.{async_name} is an async generator and has no synchronous form; "
+                f"iterate it with 'async for' instead"
+            )
 
         def _sync_call(*args: Any, **kwargs: Any) -> Any:
             return self._dq._run_sync(target(*args, **kwargs))
@@ -119,7 +121,13 @@ class _SyncProxy:
         return _sync_call
 
     def __dir__(self) -> List[str]:
-        return [n[: -len("_async")] for n in dir(self._dq) if n.endswith("_async") and not n.startswith("_")]
+        return [
+            n[: -len("_async")]
+            for n in dir(self._dq)
+            if n.endswith("_async")
+            and not n.startswith("_")
+            and not inspect.isasyncgenfunction(getattr(type(self._dq), n, None))
+        ]
 
 
 class DataQuery:
@@ -136,42 +144,53 @@ class DataQuery:
         load_dotenv()
 
         if isinstance(config_or_env_file, ClientConfig):
-            self.client_config = config_or_env_file
+            config = config_or_env_file
         else:
             env_file = None
             if isinstance(config_or_env_file, (str, Path)):
                 env_file = Path(config_or_env_file)
             config_manager = ConfigManager(env_file)
-            self.client_config = config_manager.get_client_config()
+            config = config_manager.get_client_config()
 
+        updates: Dict[str, Any] = {}
         if client_id or client_secret:
             if client_id and not isinstance(client_id, str):
                 raise ConfigurationError("client_id must be a string")
             if client_secret and not isinstance(client_secret, str):
                 raise ConfigurationError("client_secret must be a string")
 
-            self.client_config.oauth_enabled = True
+            updates["oauth_enabled"] = True
             if client_id:
-                self.client_config.client_id = client_id
+                updates["client_id"] = client_id
             if client_secret:
-                self.client_config.client_secret = SecretStr(client_secret)
-            if not self.client_config.oauth_token_url and self.client_config.base_url:
-                self.client_config.oauth_token_url = f"{self.client_config.base_url.rstrip('/')}/oauth/token"
+                updates["client_secret"] = SecretStr(client_secret)
+            if not config.oauth_token_url and config.base_url:
+                updates["oauth_token_url"] = f"{config.base_url.rstrip('/')}/oauth/token"
 
+        known_fields = set(type(config).model_fields) | set(config.model_extra or {})
         for key, value in (overrides or {}).items():
             if key in {"client_id", "client_secret"}:
                 continue
-            if hasattr(self.client_config, key) and value is not None:
-                try:
-                    setattr(self.client_config, key, value)
-                except (TypeError, ValueError) as e:
-                    logger.warning("Override ignored", key=key, error=str(e))
+            if key in known_fields and value is not None:
+                updates[key] = value
+
+        if updates:
+            # Validate on a copy so the caller's ClientConfig is never mutated.
+            try:
+                config = type(config).model_validate({**config.model_dump(), **updates})
+            except PydanticValidationError as e:
+                keys = ", ".join(sorted({str(err["loc"][0]) for err in e.errors() if err["loc"]}))
+                raise ConfigurationError(f"Invalid configuration override ({keys}): {e}") from e
+        self.client_config = config
 
         try:
             EnvConfig.validate_config(self.client_config)
         except Exception as e:
             logger.error("Configuration validation failed", error=str(e))
-            raise ConfigurationError(f"Configuration validation failed: {e}")
+            message = str(e)
+            if not message.startswith("Configuration validation failed"):
+                message = f"Configuration validation failed: {message}"
+            raise ConfigurationError(message) from e
 
         self._client: Optional[DataQueryClient] = None
         self._sync_proxy: Optional[_SyncProxy] = None
@@ -344,11 +363,13 @@ class DataQuery:
         """Download a specific file using parallel HTTP range requests."""
         await self.connect_async()
 
-        if destination_path and options is None:
+        if destination_path and options is not None:
+            options = options.model_copy(update={"destination_path": Path(destination_path)})
+        elif destination_path:
             options = DownloadOptions(
                 destination_path=destination_path,
                 create_directories=True,
-                overwrite_existing=True,
+                overwrite_existing=self.client_config.overwrite_existing,
                 chunk_size=8192,
                 max_retries=3,
                 retry_delay=1.0,
@@ -1085,7 +1106,11 @@ class DataQuery:
 
         chunks_with_errors = [f"{c['start_date']}-{c['end_date']}" for c in chunk_results if "error" in c]
         status: Literal["success", "error", "partial"]
-        if total_failed == 0 and not chunks_with_errors:
+        error: Optional[str] = None
+        if total_files == 0 and not chunks_with_errors:
+            status = "error"
+            error = NO_FILES_FOUND_ERROR
+        elif total_failed == 0 and not chunks_with_errors:
             status = "success"
         elif total_success == 0:
             status = "error"
@@ -1095,6 +1120,7 @@ class DataQuery:
         summary = OperationReport(
             operation="historical_download",
             status=status,
+            error=error,
             subject={"group_id": group_id, "start_date": start_date, "end_date": end_date},
             counts={
                 "monthly_chunks": len(monthly_ranges),
@@ -1175,16 +1201,14 @@ class DataQuery:
 
             if total_concurrent_requests > burst_capacity:
                 excess_requests = total_concurrent_requests - burst_capacity
-
-                time_window = max(5.0, excess_requests * 0.1)
-                min_delay_for_burst = time_window / excess_requests if excess_requests > 0 else 0.0
+                # Past the burst, starts are paced at the token refill interval.
+                min_delay_for_burst = 60.0 / requests_per_minute if requests_per_minute > 0 else 0.0
 
                 logger.debug(
                     "Burst capacity exceeded, calculating spread delay",
                     total_concurrent_requests=total_concurrent_requests,
                     burst_capacity=burst_capacity,
                     excess_requests=excess_requests,
-                    time_window=time_window,
                     min_delay_for_burst=min_delay_for_burst,
                 )
             else:
@@ -1390,15 +1414,14 @@ class DataQuery:
         recommendations = self._get_rate_limit_recommendations(requested_concurrency)
 
         if safe_concurrency < requested_concurrency:
-            ratio = safe_concurrency / requested_concurrency
-            optimal_max_concurrent = max(1, int(max_concurrent * ratio))
-            optimal_num_parts = max(1, int(num_parts * ratio))
-
-            while optimal_max_concurrent * optimal_num_parts > safe_concurrency:
-                if optimal_num_parts > optimal_max_concurrent:
-                    optimal_num_parts -= 1
-                else:
-                    optimal_max_concurrent -= 1
+            # Largest product within the safe limit; ties go to more concurrent files.
+            optimal_max_concurrent, optimal_num_parts = 1, 1
+            for files in range(1, max_concurrent + 1):
+                parts = min(num_parts, safe_concurrency // files)
+                if parts < 1:
+                    break
+                if files * parts >= optimal_max_concurrent * optimal_num_parts:
+                    optimal_max_concurrent, optimal_num_parts = files, parts
         else:
             optimal_max_concurrent = max_concurrent
             optimal_num_parts = num_parts
