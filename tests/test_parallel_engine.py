@@ -14,6 +14,7 @@ import builtins
 import inspect
 import typing
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -37,6 +38,8 @@ from dataquery.types.models import (
 FILES_URL = "https://files.example.com/research/dataquery-authe/api/v2/group/file/download"
 THRESHOLD = 64
 SIZE = 400
+
+_REAL_SLEEP = asyncio.sleep
 
 
 def _payload(n: int = SIZE) -> bytes:
@@ -257,6 +260,15 @@ async def run_entry(entry: str, client: DataQueryClient, dest: Path) -> Download
     if entry == "multipart":
         return await multipart(client, dest)
     return await flat(client, dest)
+
+
+async def wait_until(predicate: Callable[[], bool], timeout: float = 5.0) -> None:
+    """Poll on wall-clock time; preallocation runs in a worker thread that ``sleep(0)`` cannot wait for."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while not predicate():
+        assert loop.time() < deadline, "condition not reached before timeout"
+        await _REAL_SLEEP(0.005)
 
 
 async def drain_orphans() -> None:
@@ -868,11 +880,7 @@ async def test_cancellation_removes_temp_file(tmp_path: Path, monkeypatch: pytes
     client = make_client(server, monkeypatch, tmp_path)
     task = asyncio.ensure_future(run_entry(entry, client, tmp_path / "out"))
     try:
-        for _ in range(200):
-            if server.in_flight == 4:
-                break
-            await asyncio.sleep(0)
-        assert server.in_flight == 4
+        await wait_until(lambda: server.in_flight == 4)
         assert part_files(tmp_path)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
