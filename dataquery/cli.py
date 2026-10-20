@@ -7,7 +7,7 @@ import importlib.util
 import json
 import os
 import sys
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qs, urlsplit
@@ -166,10 +166,11 @@ def _prompt_for_mcp_credentials() -> None:
 
     if not sys.stdin.isatty():
         return
-    for key, label, ask in (
+    prompts: tuple[tuple[str, str, Callable[[str], str]], ...] = (
         ("CLIENT_ID", "DataQuery client ID: ", input),
         ("CLIENT_SECRET", "DataQuery client secret: ", getpass.getpass),
-    ):
+    )
+    for key, label, ask in prompts:
         env_key = f"{EnvConfig.PREFIX}{key}"
         if not os.environ.get(env_key):
             value = ask(label).strip()
@@ -303,7 +304,8 @@ def create_parser() -> argparse.ArgumentParser:
     p_fn.add_argument(
         "--category",
         help=(
-            "Filter by category (e.g. STATISTICAL, MATHEMATICAL, AGGREGATE, CALENDAR, MISCELLANEOUS, 'F&O SPECIFIC')"
+            "Filter by category, case-insensitive: Aggregate, Calendar, 'Futures & Options', "
+            "Mathematical, Miscellaneous, Statistical"
         ),
     )
     p_fn.add_argument("--list", action="store_true", help="List all available functions")
@@ -757,7 +759,11 @@ def cmd_config_validate(args: argparse.Namespace) -> int:
 def cmd_config_template(args: argparse.Namespace) -> int:
     import dataquery.utils as utils
 
-    out = utils.create_env_template(Path(args.output))
+    try:
+        out = utils.create_env_template(Path(args.output))
+    except OSError as exc:
+        _print_error(f"Could not write template to {args.output}: {exc}")
+        return 1
     print(f"Template written to {out}")
     return 0
 
@@ -945,6 +951,16 @@ def _maybe_export_csv(resp: Any, output_csv: Optional[str], is_grid: bool = Fals
     return info
 
 
+def _print_result_with_csv(summary: str, resp: Any, output_csv: Optional[str], is_grid: bool = False) -> None:
+    """Export CSV, then print the result; if the export fails, print the summary before re-raising."""
+    try:
+        csv_info = _maybe_export_csv(resp, output_csv, is_grid=is_grid)
+    except Exception:
+        print(summary)
+        raise
+    _print_endpoint_result(summary, resp, csv_info=csv_info)
+
+
 async def cmd_group_timeseries(args: argparse.Namespace) -> int:
     attributes = args.attributes
     async with DataQuery(args.env_file) as dq:
@@ -955,9 +971,8 @@ async def cmd_group_timeseries(args: argparse.Namespace) -> int:
             **_ts_kwargs(args),
         )
         resp, warning = await _collect_all_pages(dq, resp, args.page)
-    csv_info = _maybe_export_csv(resp, args.output_csv)
-    _print_endpoint_result(
-        _with_warning(_timeseries_summary("Group time-series", resp), warning), resp, csv_info=csv_info
+    _print_result_with_csv(
+        _with_warning(_timeseries_summary("Group time-series", resp), warning), resp, args.output_csv
     )
     return 1 if warning else 0
 
@@ -971,9 +986,8 @@ async def cmd_instrument_timeseries(args: argparse.Namespace) -> int:
             **_ts_kwargs(args),
         )
         resp, warning = await _collect_all_pages(dq, resp, args.page)
-    csv_info = _maybe_export_csv(resp, args.output_csv)
-    _print_endpoint_result(
-        _with_warning(_timeseries_summary("Instrument time-series", resp), warning), resp, csv_info=csv_info
+    _print_result_with_csv(
+        _with_warning(_timeseries_summary("Instrument time-series", resp), warning), resp, args.output_csv
     )
     return 1 if warning else 0
 
@@ -985,9 +999,8 @@ async def cmd_expression_timeseries(args: argparse.Namespace) -> int:
             **_ts_kwargs(args),
         )
         resp, warning = await _collect_all_pages(dq, resp, args.page)
-    csv_info = _maybe_export_csv(resp, args.output_csv)
-    _print_endpoint_result(
-        _with_warning(_timeseries_summary("Expression time-series", resp), warning), resp, csv_info=csv_info
+    _print_result_with_csv(
+        _with_warning(_timeseries_summary("Expression time-series", resp), warning), resp, args.output_csv
     )
     return 1 if warning else 0
 
@@ -1010,8 +1023,7 @@ async def cmd_grid_data(args: argparse.Namespace) -> int:
     for s in series:
         if s.get("errorMessage") or s.get("errorCode"):
             summary += f"\nServer error for {s.get('expr')}: [{s.get('errorCode')}] {s.get('errorMessage')}"
-    csv_info = _maybe_export_csv(resp, args.output_csv, is_grid=True)
-    _print_endpoint_result(summary, resp, csv_info=csv_info)
+    _print_result_with_csv(summary, resp, args.output_csv, is_grid=True)
     return 0
 
 
@@ -1305,9 +1317,23 @@ _ASYNC_COMMANDS = {
 }
 
 
+def _subcommand_parser(parser: argparse.ArgumentParser, name: str) -> argparse.ArgumentParser:
+    subparsers = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))
+    sub: argparse.ArgumentParser = subparsers.choices[name]
+    return sub
+
+
 def main() -> int:
     parser = create_parser()
     args = parser.parse_args()
+    try:
+        return _run(parser, args)
+    except KeyboardInterrupt:
+        print("Interrupted", file=sys.stderr)
+        return 130
+
+
+def _run(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
     if not args.command:
         parser.print_help()
         return 1
@@ -1316,10 +1342,12 @@ def main() -> int:
         # back to other settings (e.g. ~/.dataquery/.env) for a mistyped path.
         _print_error(f"--env-file not found: {args.env_file}")
         return 1
-    if args.command == "config":
-        return main_sync(args)
-    if args.command == "auth" and args.auth_command == "test":
-        return asyncio.run(cmd_auth_test(args))
+    if args.command == "config" and not args.config_command:
+        _subcommand_parser(parser, "config").print_help()
+        return 1
+    if args.command == "auth" and not args.auth_command:
+        _subcommand_parser(parser, "auth").print_help()
+        return 1
     if args.command == "function-help":
         return cmd_function_help(args)
     if args.command == "mcp-install":
@@ -1327,14 +1355,25 @@ def main() -> int:
     if args.command == "skill-install":
         return cmd_skill_install(args)
 
-    handler = _ASYNC_COMMANDS.get(args.command)
-    if handler is None:
-        parser.print_help()
-        return 1
     try:
+        if args.command == "config":
+            return main_sync(args)
+        if args.command == "auth":
+            return asyncio.run(cmd_auth_test(args))
+        handler = _ASYNC_COMMANDS.get(args.command)
+        if handler is None:
+            parser.print_help()
+            return 1
         return asyncio.run(handler(args))
     except DataQueryError as exc:
-        _print_error(str(exc), suggestion=getattr(exc, "suggestion", None))
+        suggestion = getattr(exc, "suggestion", None)
+        if args.command == "mcp-connect":
+            # stdout is the MCP client's JSON-RPC channel: keep errors on stderr.
+            print(str(exc), file=sys.stderr)
+            if suggestion:
+                print(suggestion, file=sys.stderr)
+        else:
+            _print_error(str(exc), suggestion=suggestion)
         return 1
 
 

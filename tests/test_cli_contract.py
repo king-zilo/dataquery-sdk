@@ -549,7 +549,6 @@ def test_main_sync_returns_0_for_non_config_commands() -> None:
     assert cli.main_sync(argparse.Namespace(command="config", config_command=None)) == 1
 
 
-@pytest.mark.xfail(strict=True, reason="F8: Ctrl+C in a non-watch command dumps a KeyboardInterrupt traceback")
 def test_ctrl_c_exits_130_without_a_traceback(run: Any, use_dq: Any) -> None:
     use_dq(list_groups_async=AsyncMock(side_effect=KeyboardInterrupt()))
     try:
@@ -792,7 +791,6 @@ def test_config_show_prints_only_a_confirmation(run: Any) -> None:
     assert run("config", "show") == (0, "Configuration loaded\n", "")
 
 
-@pytest.mark.xfail(strict=True, reason="F2: config show lets ConfigurationError escape as a traceback")
 @pytest.mark.parametrize(
     ("env", "message"),
     [
@@ -828,7 +826,6 @@ def test_config_template_writes_the_file(run: Any, tmp_path: Path) -> None:
     assert "DATAQUERY_BASE_URL=" in out_file.read_text()
 
 
-@pytest.mark.xfail(strict=True, reason="F7: config template lets an OSError escape as a traceback")
 def test_config_template_reports_unwritable_paths(run: Any, tmp_path: Path) -> None:
     blocker = tmp_path / "file"
     blocker.write_text("")
@@ -837,14 +834,12 @@ def test_config_template_reports_unwritable_paths(run: Any, tmp_path: Path) -> N
     assert "Could not write template" in err
 
 
-@pytest.mark.xfail(strict=True, reason="F3: a bare `dataquery config` exits 1 and prints nothing")
 def test_bare_config_prints_config_help(run: Any) -> None:
     rc, out, _ = run("config")
     assert rc == 1
     assert out.startswith("usage: dataquery config")
 
 
-@pytest.mark.xfail(strict=True, reason="F3: a bare `dataquery auth` prints the top-level help, not the auth help")
 def test_bare_auth_prints_auth_help(run: Any) -> None:
     rc, out, _ = run("auth")
     assert rc == 1
@@ -857,7 +852,6 @@ def test_auth_test_success(run: Any, use_dq: Any) -> None:
     fake.list_groups_async.assert_awaited_once_with(limit=100)
 
 
-@pytest.mark.xfail(strict=True, reason="F1: auth test runs outside main()'s handler, so errors are tracebacks")
 def test_auth_test_failure_is_reported(run: Any, use_dq: Any) -> None:
     use_dq(list_groups_async=AsyncMock(side_effect=AuthenticationError("bad credentials")))
     rc, out, err = run("auth", "test")
@@ -866,7 +860,6 @@ def test_auth_test_failure_is_reported(run: Any, use_dq: Any) -> None:
     assert _json_section(out) == {"status": "error", "error_description": "bad credentials"}
 
 
-@pytest.mark.xfail(strict=True, reason="F1: auth test without credentials raises ConfigurationError")
 def test_auth_test_without_credentials_is_reported(run: Any) -> None:
     os.environ["DATAQUERY_BASE_URL"] = "https://dq.example.com"
     rc, out, err = run("auth", "test")
@@ -1033,7 +1026,6 @@ def test_timeseries_stops_when_next_page_is_none(run: Any, use_dq: Any) -> None:
     assert "More pages available; fetch the next one with --page 2" in out
 
 
-@pytest.mark.xfail(strict=True, reason="F5: a failed CSV export hides the time-series summary")
 def test_timeseries_export_failure_still_shows_the_summary(run: Any, use_dq: Any, tmp_path: Path) -> None:
     use_dq(get_group_time_series_async=_ts_response(["A"]))
     rc, out, err = run(
@@ -1080,7 +1072,6 @@ def test_grid_data_response_error_without_csv(run: Any, use_dq: Any) -> None:
     assert out.startswith("Grid: 0 series, 0 record(s)\nServer error: [E1] bad expr\n")
 
 
-@pytest.mark.xfail(strict=True, reason="F5: grid-data exports before printing its summary; the server error is lost")
 def test_grid_data_export_failure_shows_the_server_error(run: Any, use_dq: Any, tmp_path: Path) -> None:
     use_dq(get_grid_data_async=_grid({"errorCode": "E1", "errorMessage": "bad expr"}))
     rc, out, err = run("grid-data", "--expr", "X", "--output-csv", str(tmp_path / "g.csv"))
@@ -1148,7 +1139,6 @@ def test_function_help_unknown_category_exits_0(run: Any) -> None:
     assert run("function-help", "--category", "NOPE") == (0, "Available functions: 0\n", "")
 
 
-@pytest.mark.xfail(strict=True, reason="F4: --category help suggests 'F&O SPECIFIC', which matches no function")
 def test_function_help_category_help_names_real_categories() -> None:
     from dataquery.function_registry import get_function_categories, list_functions_by_category
 
@@ -1172,7 +1162,6 @@ def test_mcp_connect_without_the_extra(run: Any, monkeypatch: pytest.MonkeyPatch
     assert err.startswith("The MCP bridge requires the 'mcp' extra.")
 
 
-@pytest.mark.xfail(strict=True, reason="F9: mcp-connect writes its startup error envelope to stdout (JSON-RPC)")
 def test_mcp_connect_startup_error_stays_off_stdout(run: Any) -> None:
     os.environ["DATAQUERY_BASE_URL"] = "https://dq.example.com"
     os.environ["DATAQUERY_TIMEOUT"] = "abc"
