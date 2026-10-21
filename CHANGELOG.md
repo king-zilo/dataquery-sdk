@@ -78,3 +78,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - `dataquery auth test` prints `Authentication successful.` on success instead of exiting silently
 
+## [Unreleased]
+### Changed
+- Internal refactor of the catalog, time-series, grid and group request methods onto shared helpers; requests, results, errors and log events are unchanged
