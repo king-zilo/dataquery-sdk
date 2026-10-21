@@ -5,6 +5,7 @@ Targeted tests to improve rate_limiter.py coverage.
 import asyncio
 import time
 from datetime import datetime, timedelta
+from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -282,7 +283,7 @@ import asyncio as _asyncio_rl_adv
 
 
 def _make_rate_limiter(**overrides) -> EnhancedTokenBucketRateLimiter:
-    base = dict(
+    base: dict[str, Any] = dict(
         requests_per_minute=60,
         burst_capacity=1,
         enable_rate_limiting=True,
@@ -499,3 +500,21 @@ class TestAcquireDoesNotHoldLockWhileSleeping:
 
         assert sum(1 for granted in results if granted) == 3
         assert rl.state.tokens < 1.0
+
+
+def test_reset_from_sync_code_restores_full_bucket():
+    limiter = EnhancedTokenBucketRateLimiter(RateLimitConfig(requests_per_minute=60, burst_capacity=5))
+    limiter.state.tokens = 0.0
+    limiter.state.consecutive_failures = 3
+    limiter.reset()
+    assert limiter.state.tokens == 5.0
+    assert limiter.state.consecutive_failures == 0
+
+
+@pytest.mark.asyncio
+async def test_reset_inside_loop_takes_effect_immediately():
+    limiter = EnhancedTokenBucketRateLimiter(RateLimitConfig(requests_per_minute=60, burst_capacity=2))
+    assert await limiter.acquire(timeout=0.1)
+    assert await limiter.acquire(timeout=0.1)
+    limiter.reset()
+    assert limiter.state.tokens == 2.0

@@ -1356,8 +1356,12 @@ class DataQueryClient(
         max_tracked_files: int = 10_000,
         max_tracked_errors: int = 1_000,
     ) -> "NotificationDownloadManager":
-        """Synchronous wrapper for :meth:`auto_download_async`."""
-        return asyncio.run(
+        """Synchronous wrapper for :meth:`auto_download_async`.
+
+        The manager keeps running on the client's persistent background loop
+        after this returns.
+        """
+        return self._run_sync(
             self.auto_download_async(
                 group_id,
                 destination_dir,

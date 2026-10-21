@@ -227,15 +227,15 @@ class EnhancedTokenBucketRateLimiter:
         }
 
     def reset(self) -> None:
-        """Reset rate limiter state."""
+        """Reset rate limiter state.
 
-        async def _reset():
-            async with self._get_lock():
-                self.state = RateLimitState()
-                self.state.tokens = float(self.config.burst_capacity)
-                self.state.last_refill = time.time()
-
-        asyncio.create_task(_reset())
+        Synchronous and lock-free: it never awaits, so it cannot interleave
+        with an ``acquire`` holding the lock on the same event loop.
+        """
+        state = RateLimitState()
+        state.tokens = float(self.config.burst_capacity)
+        state.last_refill = time.time()
+        self.state = state
         logger.info("Rate limiter reset")
 
     async def shutdown(self) -> None:

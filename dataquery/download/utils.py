@@ -35,27 +35,43 @@ def file_exists_locally(destination_dir: Path, file_group_id: str, date_str: str
     return False
 
 
+class _ProgressStatsWrapper:
+    """Progress callback that adds each file's newly received bytes to ``stats`` once."""
+
+    def __init__(
+        self,
+        stats: Dict[str, Any],
+        user_callback: Optional[Callable],
+        logger_instance: logging.Logger,
+    ) -> None:
+        self._stats = stats
+        self._user_callback = user_callback
+        self._logger = logger_instance
+        self.bytes_counted = 0
+
+    def __call__(self, progress: DownloadProgress) -> None:
+        downloaded = int(getattr(progress, "bytes_downloaded", 0) or 0)
+        if downloaded > self.bytes_counted:
+            current_total = int(self._stats.get("total_bytes_downloaded", 0) or 0)
+            self._stats["total_bytes_downloaded"] = current_total + downloaded - self.bytes_counted
+            self.bytes_counted = downloaded
+        if self._user_callback:
+            try:
+                if inspect.iscoroutinefunction(self._user_callback):
+                    asyncio.create_task(self._user_callback(progress))
+                else:
+                    self._user_callback(progress)
+            except Exception as e:
+                self._logger.error("Error in progress callback: %s", e)
+
+
 def create_progress_wrapper(
     stats: Dict[str, Any],
     user_callback: Optional[Callable] = None,
     logger_instance: Optional[logging.Logger] = None,
-) -> Callable[[DownloadProgress], None]:
+) -> _ProgressStatsWrapper:
     """Create a progress callback that updates stats and optionally delegates to a user callback."""
-    _logger = logger_instance or logger
-
-    def wrapper(progress: DownloadProgress) -> None:
-        current_total = int(stats.get("total_bytes_downloaded", 0) or 0)
-        stats["total_bytes_downloaded"] = max(current_total, int(getattr(progress, "bytes_downloaded", 0) or 0))
-        if user_callback:
-            try:
-                if inspect.iscoroutinefunction(user_callback):
-                    asyncio.create_task(user_callback(progress))
-                else:
-                    user_callback(progress)
-            except Exception as e:
-                _logger.error("Error in progress callback: %s", e)
-
-    return wrapper
+    return _ProgressStatsWrapper(stats, user_callback, logger_instance or logger)
 
 
 async def download_and_track(
@@ -104,9 +120,11 @@ async def download_and_track(
             file_size = getattr(result, "file_size", None)
             if file_size:
                 try:
-                    stats["total_bytes_downloaded"] += int(file_size)
+                    remaining = int(file_size) - wrapper.bytes_counted
                 except (TypeError, ValueError):
-                    pass
+                    remaining = 0
+                if remaining > 0:
+                    stats["total_bytes_downloaded"] += remaining
 
         else:
             error_msg = getattr(result, "error_message", "Unknown") if result else "No result"
