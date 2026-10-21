@@ -219,3 +219,30 @@ async def test_enter_request_cm_accepts_direct_cm_and_coroutine_cm():
     cm2 = await c._enter_request_cm("GET", "u")
     async with cm2 as v2:
         assert v2 == "ok"
+
+
+def test_sync_auto_download_keeps_manager_tasks_alive(monkeypatch):
+    import dataquery.sse.subscriber as subscriber
+
+    async def fake_start(self):
+        self._running = True
+
+        async def listen():
+            await asyncio.sleep(3600)
+
+        self._listener = asyncio.create_task(listen())
+        return self
+
+    monkeypatch.setattr(subscriber.NotificationDownloadManager, "start", fake_start)
+    client = DataQueryClient(ClientConfig(client_id="x", client_secret="y"))
+    try:
+        manager = client.auto_download("G", enable_event_replay=False)
+        assert manager.is_running
+        assert not manager._listener.done()
+
+        async def cancel():
+            manager._listener.cancel()
+
+        client._run_sync(cancel())
+    finally:
+        client._sync_runner.close()
