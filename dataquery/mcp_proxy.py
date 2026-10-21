@@ -15,6 +15,7 @@ import structlog
 from .config import EnvConfig
 from .transport.auth import OAuthManager
 from .types.exceptions import AuthenticationError, ConfigurationError, NetworkError
+from .types.models import ClientConfig
 
 logger = structlog.get_logger(__name__)
 
@@ -260,14 +261,29 @@ def _configure_stderr_logging() -> None:
     )
 
 
+def _client_config_with_base_url(url: str) -> ClientConfig:
+    """Read the env config with BASE_URL set to the MCP URL's origin for this call only."""
+    key = f"{EnvConfig.PREFIX}BASE_URL"
+    previous = os.environ.get(key)
+    parts = urlsplit(url)
+    os.environ[key] = f"{parts.scheme}://{parts.netloc}"
+    try:
+        return EnvConfig.create_client_config()
+    finally:
+        if previous is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = previous
+
+
 def _build_oauth_manager(url: str, env_file: Path | None) -> OAuthManager:
     """Build the OAuth manager from env config."""
     if env_file is not None:
         EnvConfig.load_env_file(env_file)
-    if not EnvConfig.get_env_var("BASE_URL"):
-        parts = urlsplit(url)
-        os.environ[f"{EnvConfig.PREFIX}BASE_URL"] = f"{parts.scheme}://{parts.netloc}"
-    config = EnvConfig.create_client_config()
+    if EnvConfig.get_env_var("BASE_URL"):
+        config = EnvConfig.create_client_config()
+    else:
+        config = _client_config_with_base_url(url)
     oauth = OAuthManager(config)
     if not oauth.is_authenticated():
         raise ConfigurationError(

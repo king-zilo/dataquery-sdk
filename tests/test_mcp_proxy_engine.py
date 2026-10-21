@@ -847,9 +847,28 @@ async def test_empty_base_url_is_derived_from_the_mcp_url(
 ) -> None:
     monkeypatch.setenv("DATAQUERY_BASE_URL", "")
     oauth = mcp_proxy._build_oauth_manager(fake.mcp_url, None)
-    origin = fake.mcp_url.rsplit("/", 1)[0]
-    assert os.environ["DATAQUERY_BASE_URL"] == origin
-    assert oauth.config.base_url == origin
+    assert oauth.config.base_url == fake.mcp_url.rsplit("/", 1)[0]
+    assert os.environ["DATAQUERY_BASE_URL"] == ""
+
+
+async def test_derived_base_url_does_not_leak_into_later_proxies(
+    proxy_env: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("DATAQUERY_BASE_URL", "")
+    first = mcp_proxy._build_oauth_manager("https://first.example/mcp", None)
+    second = mcp_proxy._build_oauth_manager("https://second.example:8443/mcp", None)
+    assert first.config.base_url == "https://first.example"
+    assert second.config.base_url == "https://second.example:8443"
+    assert os.environ["DATAQUERY_BASE_URL"] == ""
+
+
+async def test_derived_base_url_helper_leaves_an_unset_variable_unset(
+    proxy_env: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("DATAQUERY_BASE_URL", raising=False)
+    config = mcp_proxy._client_config_with_base_url("https://only.example/mcp")
+    assert config.base_url == "https://only.example"
+    assert "DATAQUERY_BASE_URL" not in os.environ
 
 
 async def test_env_file_supplies_the_configuration(

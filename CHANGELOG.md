@@ -84,3 +84,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - MCP: the proxy skips stdin lines that are valid JSON but not an object (e.g. a batch array), and lines over 64 MiB, instead of exiting; SSE events are no longer limited by aiohttp's line-length cap
 - MCP: at stdin EOF the proxy lets in-flight requests finish (up to 30 s) instead of cancelling them, and the session `DELETE` on shutdown gives up after 5 s
 - MCP: concurrent requests rejected with the same stale token share one token refresh; an unreachable token endpoint at startup prints `dataquery mcp connect: …` and exits 1 instead of a traceback
+- MCP: with `DATAQUERY_BASE_URL` set but empty, the base URL derived from the MCP URL no longer stays in the process environment, so a later proxy in the same process uses its own MCP URL's origin
