@@ -69,7 +69,7 @@ P = TypeVar("P", bound=Paginated)
 
 
 class _RequestProto:
-    """Static typing shim for HTTP helpers the query mixins call on ``self``."""
+    """HTTP helpers the query mixins call on ``self`` (stubs implemented by the client)."""
 
     def _build_api_url(self, endpoint: str) -> str:  # pragma: no cover - stub
         raise NotImplementedError
@@ -86,6 +86,13 @@ class _RequestProto:
         self, response: aiohttp.ClientResponse
     ) -> None:
         raise NotImplementedError
+
+    async def _get_json(self, endpoint: str, params: Dict[str, Any]) -> Any:
+        """GET an API endpoint, vet the status, and return the decoded JSON body."""
+        url = self._build_api_url(endpoint)
+        async with await self._enter_request_cm("GET", url, params=params) as response:
+            await self._handle_response(response)
+            return await response.json()
 
 
 def check_envelope(payload: Any, known_keys: Iterable[str], source: str = "endpoint") -> bool:
@@ -133,6 +140,10 @@ class PaginationMixin(_RequestProto):
             # ``info`` is a Paginated field, so a no-content envelope parses as an empty page.
             check_envelope(payload, known, "paginated endpoint")
         return model_cls(**payload)
+
+    async def _get_page(self, endpoint: str, model_cls: Type[P], params: Dict[str, Any]) -> P:
+        """Fetch one page of ``endpoint`` and build it as ``model_cls``."""
+        return self._build_page(model_cls, await self._get_json(endpoint, params))
 
     async def get_next_page_async(self, page: P) -> Optional[P]:
         """Fetch the page after ``page``, or ``None`` if it is the last page."""
@@ -218,6 +229,17 @@ class PaginationMixin(_RequestProto):
             yield page
             next_url = page.get_next_link()
 
+    async def _iter_page_items(
+        self,
+        fetch_first: Callable[[], Awaitable[P]],
+        attr: str,
+        max_pages: int,
+    ) -> AsyncIterator[Any]:
+        """Yield each item of the ``attr`` list on every page, lazily."""
+        async for page in self.iter_pages(fetch_first, max_pages=max_pages):
+            for item in getattr(page, attr):
+                yield item
+
 
 def _page_item_count(page: Paginated) -> int:
     """Best-effort count of records in a page across all known response shapes."""
@@ -243,12 +265,7 @@ class InstrumentsMixin(PaginationMixin):
             params["instrument-id"] = instrument_id
         if page:
             params["page"] = page
-
-        url = self._build_api_url(C.API_GROUP_INSTRUMENTS)
-        async with await self._enter_request_cm("GET", url, params=params) as response:
-            await self._handle_response(response)
-            data = await response.json()
-            return self._build_page(InstrumentsResponse, data)
+        return await self._get_page(C.API_GROUP_INSTRUMENTS, InstrumentsResponse, params)
 
     async def iter_instruments_async(
         self,
@@ -258,13 +275,10 @@ class InstrumentsMixin(PaginationMixin):
         max_pages: int = PAGINATION_DEFAULT_MAX_PAGES,
     ) -> AsyncIterator[Any]:
         """Yield every instrument across all pages, lazily."""
-
-        async def _first() -> InstrumentsResponse:
-            return await self.list_instruments_async(group_id, instrument_id)
-
-        async for page in self.iter_pages(_first, max_pages=max_pages):
-            for inst in page.instruments:
-                yield inst
+        async for inst in self._iter_page_items(
+            lambda: self.list_instruments_async(group_id, instrument_id), "instruments", max_pages
+        ):
+            yield inst
 
     async def search_instruments_async(
         self,
@@ -276,12 +290,7 @@ class InstrumentsMixin(PaginationMixin):
         params: dict = {"group-id": group_id, "keywords": keywords}
         if page:
             params["page"] = page
-
-        url = self._build_api_url(C.API_GROUP_INSTRUMENTS_SEARCH)
-        async with await self._enter_request_cm("GET", url, params=params) as response:
-            await self._handle_response(response)
-            data = await response.json()
-            return self._build_page(InstrumentsResponse, data)
+        return await self._get_page(C.API_GROUP_INSTRUMENTS_SEARCH, InstrumentsResponse, params)
 
     async def iter_search_instruments_async(
         self,
@@ -291,13 +300,10 @@ class InstrumentsMixin(PaginationMixin):
         max_pages: int = PAGINATION_DEFAULT_MAX_PAGES,
     ) -> AsyncIterator[Any]:
         """Yield every instrument matching ``keywords`` across all pages."""
-
-        async def _first() -> InstrumentsResponse:
-            return await self.search_instruments_async(group_id, keywords)
-
-        async for page in self.iter_pages(_first, max_pages=max_pages):
-            for inst in page.instruments:
-                yield inst
+        async for inst in self._iter_page_items(
+            lambda: self.search_instruments_async(group_id, keywords), "instruments", max_pages
+        ):
+            yield inst
 
 
 class MetadataMixin(PaginationMixin):
@@ -308,12 +314,7 @@ class MetadataMixin(PaginationMixin):
         params: dict = {"group-id": group_id}
         if page:
             params["page"] = page
-
-        url = self._build_api_url(C.API_GROUP_FILTERS)
-        async with await self._enter_request_cm("GET", url, params=params) as response:
-            await self._handle_response(response)
-            payload = await response.json()
-            return self._build_page(FiltersResponse, payload)
+        return await self._get_page(C.API_GROUP_FILTERS, FiltersResponse, params)
 
     async def iter_group_filters_async(
         self,
@@ -322,13 +323,8 @@ class MetadataMixin(PaginationMixin):
         max_pages: int = PAGINATION_DEFAULT_MAX_PAGES,
     ) -> AsyncIterator[Any]:
         """Yield every filter dimension across all pages."""
-
-        async def _first() -> FiltersResponse:
-            return await self.get_group_filters_async(group_id)
-
-        async for page in self.iter_pages(_first, max_pages=max_pages):
-            for f in page.filters:
-                yield f
+        async for f in self._iter_page_items(lambda: self.get_group_filters_async(group_id), "filters", max_pages):
+            yield f
 
     async def get_group_attributes_async(
         self,
@@ -342,12 +338,7 @@ class MetadataMixin(PaginationMixin):
             params["instrument-id"] = instrument_id
         if page:
             params["page"] = page
-
-        url = self._build_api_url(C.API_GROUP_ATTRIBUTES)
-        async with await self._enter_request_cm("GET", url, params=params) as response:
-            await self._handle_response(response)
-            payload = await response.json()
-            return self._build_page(AttributesResponse, payload)
+        return await self._get_page(C.API_GROUP_ATTRIBUTES, AttributesResponse, params)
 
     async def iter_group_attributes_async(
         self,
@@ -357,17 +348,42 @@ class MetadataMixin(PaginationMixin):
         max_pages: int = PAGINATION_DEFAULT_MAX_PAGES,
     ) -> AsyncIterator[Any]:
         """Yield every instrument-with-attributes across all pages."""
+        async for inst in self._iter_page_items(
+            lambda: self.get_group_attributes_async(group_id, instrument_id), "instruments", max_pages
+        ):
+            yield inst
 
-        async def _first() -> AttributesResponse:
-            return await self.get_group_attributes_async(group_id, instrument_id)
 
-        async for page in self.iter_pages(_first, max_pages=max_pages):
-            for inst in page.instruments:
-                yield inst
+def _conversion_params(calendar: str, frequency: str, conversion: str, nan_treatment: str) -> Dict[str, str]:
+    """Calendar/frequency/conversion/NaN query params shared by every time-series endpoint."""
+    return {
+        "calendar": calendar,
+        "frequency": frequency,
+        "conversion": conversion,
+        "nan-treatment": nan_treatment,
+    }
 
 
 class TimeSeriesMixin(PaginationMixin):
     """Time-series retrieval by instrument, expression, or group."""
+
+    async def _get_time_series_page(
+        self,
+        endpoint: str,
+        params: Dict[str, Any],
+        start_date: Optional[str],
+        end_date: Optional[str],
+        page: Optional[str],
+    ) -> TimeSeriesResponse:
+        """Validate the date window, append the optional params, and fetch one page."""
+        if start_date is not None:
+            validate_date_format(start_date, "start-date")
+        if end_date is not None:
+            validate_date_format(end_date, "end-date")
+        for key, value in (("start-date", start_date), ("end-date", end_date), ("page", page)):
+            if value is not None:
+                params[key] = value
+        return await self._get_page(endpoint, TimeSeriesResponse, params)
 
     async def get_instrument_time_series_async(
         self,
@@ -386,33 +402,14 @@ class TimeSeriesMixin(PaginationMixin):
         """Time series for explicit instrument + attribute identifiers."""
         validate_instruments_list(instruments)
         validate_attributes_list(attributes)
-        if start_date is not None:
-            validate_date_format(start_date, "start-date")
-        if end_date is not None:
-            validate_date_format(end_date, "end-date")
-
-        params: dict = {
+        params: Dict[str, Any] = {
             "instruments": instruments,
             "attributes": attributes,
             "data": data,
             "format": format,
-            "calendar": calendar,
-            "frequency": frequency,
-            "conversion": conversion,
-            "nan-treatment": nan_treatment,
+            **_conversion_params(calendar, frequency, conversion, nan_treatment),
         }
-        if start_date is not None:
-            params["start-date"] = start_date
-        if end_date is not None:
-            params["end-date"] = end_date
-        if page is not None:
-            params["page"] = page
-
-        url = self._build_api_url(C.API_INSTRUMENTS_TIME_SERIES)
-        async with await self._enter_request_cm("GET", url, params=params) as response:
-            await self._handle_response(response)
-            payload = await response.json()
-            return self._build_page(TimeSeriesResponse, payload)
+        return await self._get_time_series_page(C.API_INSTRUMENTS_TIME_SERIES, params, start_date, end_date, page)
 
     async def get_expressions_time_series_async(
         self,
@@ -433,34 +430,15 @@ class TimeSeriesMixin(PaginationMixin):
         for expr in expressions:
             if not isinstance(expr, str) or not expr.strip():
                 raise ValueError("All expressions must be non-empty strings")
-        if start_date is not None:
-            validate_date_format(start_date, "start-date")
-        if end_date is not None:
-            validate_date_format(end_date, "end-date")
-
-        params: dict = {
+        params: Dict[str, Any] = {
             # Repeated query params, like "instruments": expressions contain commas
             # (DB(a,b,c)), so a comma-joined value cannot be split back apart.
             "expressions": expressions,
             "format": format,
-            "calendar": calendar,
-            "frequency": frequency,
-            "conversion": conversion,
-            "nan-treatment": nan_treatment,
+            **_conversion_params(calendar, frequency, conversion, nan_treatment),
             "data": data,
         }
-        if start_date is not None:
-            params["start-date"] = start_date
-        if end_date is not None:
-            params["end-date"] = end_date
-        if page is not None:
-            params["page"] = page
-
-        url = self._build_api_url(C.API_EXPRESSIONS_TIME_SERIES)
-        async with await self._enter_request_cm("GET", url, params=params) as response:
-            await self._handle_response(response)
-            payload = await response.json()
-            return self._build_page(TimeSeriesResponse, payload)
+        return await self._get_time_series_page(C.API_EXPRESSIONS_TIME_SERIES, params, start_date, end_date, page)
 
     async def get_group_time_series_async(
         self,
@@ -479,35 +457,16 @@ class TimeSeriesMixin(PaginationMixin):
     ) -> "TimeSeriesResponse":
         """Time series across instruments + analytics of a dataset, with optional filter."""
         validate_attributes_list(attributes)
-        if start_date is not None:
-            validate_date_format(start_date, "start-date")
-        if end_date is not None:
-            validate_date_format(end_date, "end-date")
-
-        params: dict = {
+        params: Dict[str, Any] = {
             "group-id": group_id,
             "attributes": attributes,
             "data": data,
             "format": format,
-            "calendar": calendar,
-            "frequency": frequency,
-            "conversion": conversion,
-            "nan-treatment": nan_treatment,
+            **_conversion_params(calendar, frequency, conversion, nan_treatment),
         }
         if filter is not None:
             params["filter"] = filter
-        if start_date is not None:
-            params["start-date"] = start_date
-        if end_date is not None:
-            params["end-date"] = end_date
-        if page is not None:
-            params["page"] = page
-
-        url = self._build_api_url(C.API_GROUP_TIME_SERIES)
-        async with await self._enter_request_cm("GET", url, params=params) as response:
-            await self._handle_response(response)
-            payload = await response.json()
-            return self._build_page(TimeSeriesResponse, payload)
+        return await self._get_time_series_page(C.API_GROUP_TIME_SERIES, params, start_date, end_date, page)
 
     async def iter_instrument_time_series_async(
         self,
@@ -526,8 +485,8 @@ class TimeSeriesMixin(PaginationMixin):
     ) -> AsyncIterator[Any]:
         """Yield every instrument-with-time-series across all pages."""
 
-        async def _first() -> TimeSeriesResponse:
-            return await self.get_instrument_time_series_async(
+        def _first() -> Awaitable[TimeSeriesResponse]:
+            return self.get_instrument_time_series_async(
                 instruments=instruments,
                 attributes=attributes,
                 data=data,
@@ -540,9 +499,8 @@ class TimeSeriesMixin(PaginationMixin):
                 nan_treatment=nan_treatment,
             )
 
-        async for page in self.iter_pages(_first, max_pages=max_pages):
-            for inst in page.instruments:
-                yield inst
+        async for inst in self._iter_page_items(_first, "instruments", max_pages):
+            yield inst
 
     async def iter_expressions_time_series_async(
         self,
@@ -560,8 +518,8 @@ class TimeSeriesMixin(PaginationMixin):
     ) -> AsyncIterator[Any]:
         """Yield every instrument-with-time-series across all pages of an expression query."""
 
-        async def _first() -> TimeSeriesResponse:
-            return await self.get_expressions_time_series_async(
+        def _first() -> Awaitable[TimeSeriesResponse]:
+            return self.get_expressions_time_series_async(
                 expressions=expressions,
                 format=format,
                 start_date=start_date,
@@ -573,9 +531,8 @@ class TimeSeriesMixin(PaginationMixin):
                 data=data,
             )
 
-        async for page in self.iter_pages(_first, max_pages=max_pages):
-            for inst in page.instruments:
-                yield inst
+        async for inst in self._iter_page_items(_first, "instruments", max_pages):
+            yield inst
 
     async def iter_group_time_series_async(
         self,
@@ -595,8 +552,8 @@ class TimeSeriesMixin(PaginationMixin):
     ) -> AsyncIterator[Any]:
         """Yield every instrument-with-time-series across all pages of a group query."""
 
-        async def _first() -> TimeSeriesResponse:
-            return await self.get_group_time_series_async(
+        def _first() -> Awaitable[TimeSeriesResponse]:
+            return self.get_group_time_series_async(
                 group_id=group_id,
                 attributes=attributes,
                 filter=filter,
@@ -610,9 +567,8 @@ class TimeSeriesMixin(PaginationMixin):
                 nan_treatment=nan_treatment,
             )
 
-        async for page in self.iter_pages(_first, max_pages=max_pages):
-            for inst in page.instruments:
-                yield inst
+        async for inst in self._iter_page_items(_first, "instruments", max_pages):
+            yield inst
 
 
 class GridMixin(_RequestProto):
@@ -640,13 +596,10 @@ class GridMixin(_RequestProto):
         if date is not None:
             params["date"] = date
 
-        url = self._build_api_url(C.API_GRID_DATA)
-        async with await self._enter_request_cm("GET", url, params=params) as response:
-            await self._handle_response(response)
-            payload = await response.json()
-            if check_envelope(payload, ("series", "errorCode", "errorMessage"), "grid-data"):
-                return GridDataResponse.model_validate({"series": []})
-            return GridDataResponse(**payload)
+        payload = await self._get_json(C.API_GRID_DATA, params)
+        if check_envelope(payload, ("series", "errorCode", "errorMessage"), "grid-data"):
+            return GridDataResponse.model_validate({"series": []})
+        return GridDataResponse(**payload)
 
 
 class SearchMixin(_RequestProto):
