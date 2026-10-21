@@ -4,8 +4,9 @@ import asyncio
 import json
 import os
 import sys
+from collections.abc import AsyncIterator, Callable, Coroutine
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, Optional
+from typing import Any, Final
 from urllib.parse import urlsplit
 
 import aiohttp
@@ -13,15 +14,25 @@ import structlog
 
 from .config import EnvConfig
 from .transport.auth import OAuthManager
-from .types.exceptions import AuthenticationError, ConfigurationError
+from .types.exceptions import AuthenticationError, ConfigurationError, NetworkError
+from .types.models import ClientConfig
 
 logger = structlog.get_logger(__name__)
 
-_SESSION_HEADER = "Mcp-Session-Id"
-_PROTOCOL_HEADER = "MCP-Protocol-Version"
+_SESSION_HEADER: Final = "Mcp-Session-Id"
+_PROTOCOL_HEADER: Final = "MCP-Protocol-Version"
 
-_GET_BACKOFF_INITIAL = 1.0
-_GET_BACKOFF_MAX = 30.0
+_GET_BACKOFF_INITIAL: Final = 1.0
+_GET_BACKOFF_MAX: Final = 30.0
+
+# Longest stdin line accepted; longer lines are skipped.
+_STDIN_LIMIT: Final = 64 * 1024 * 1024
+# How long in-flight requests may run after stdin closes.
+_DRAIN_TIMEOUT: Final = 30.0
+# How long the session DELETE may take on shutdown.
+_CLOSE_TIMEOUT: Final = 5.0
+
+_TRANSPORT_ERROR_CODE: Final = -32001
 
 
 class StreamableHttpProxy:
@@ -32,16 +43,16 @@ class StreamableHttpProxy:
         url: str,
         oauth: OAuthManager,
         session: aiohttp.ClientSession,
-        emit: Callable[[Dict[str, Any]], None],
+        emit: Callable[[dict[str, Any]], None],
     ):
         self.url = url
         self.oauth = oauth
         self.session = session
         self.emit = emit
-        self.session_id: Optional[str] = None
-        self.protocol_version: Optional[str] = None
+        self.session_id: str | None = None
+        self.protocol_version: str | None = None
 
-    async def _headers(self) -> Dict[str, str]:
+    async def _headers(self) -> dict[str, str]:
         headers = await self.oauth.get_headers()
         headers["Accept"] = "application/json, text/event-stream"
         if self.session_id:
@@ -50,8 +61,29 @@ class StreamableHttpProxy:
             headers[_PROTOCOL_HEADER] = self.protocol_version
         return headers
 
-    async def handle_message(self, message: Dict[str, Any]) -> None:
+    async def handle_message(self, message: dict[str, Any]) -> None:
         """POST one client message to the endpoint and emit whatever comes back."""
+        request_id = message.get("id")
+        replied = False
+
+        def emit(payload: Any) -> None:
+            nonlocal replied
+            self._emit_message(payload)
+            replied = replied or _is_reply(payload, request_id)
+
+        try:
+            await self._post(message, emit)
+        except Exception as exc:
+            # Whatever went wrong, a request must still get an answer.
+            logger.error("MCP request failed", error=_describe(exc), replied=replied)
+            if not replied:
+                if isinstance(exc, json.JSONDecodeError | aiohttp.ContentTypeError):
+                    text = "MCP endpoint returned a response that is not valid JSON"
+                else:
+                    text = f"MCP request failed: {_describe(exc)}"
+                self._emit_transport_error(message, text)
+
+    async def _post(self, message: dict[str, Any], emit: Callable[[Any], None]) -> None:
         for attempt in (1, 2):
             headers = await self._headers()
             headers["Content-Type"] = "application/json"
@@ -64,10 +96,10 @@ class StreamableHttpProxy:
 
             async with resp:
                 if resp.status == 401 and attempt == 1:
-                    # Token likely expired between refresh checks; force a
-                    # fresh one and retry once.
+                    # Token likely expired between refresh checks; replace it
+                    # (once, however many requests it failed) and retry once.
                     logger.info("401 from MCP endpoint, refreshing token")
-                    await self.oauth.force_refresh()
+                    await self.oauth.refresh_after_rejection(headers.get("Authorization", ""))
                     continue
 
                 if resp.status in (202, 204):
@@ -91,11 +123,10 @@ class StreamableHttpProxy:
 
                 content_type = resp.headers.get("Content-Type", "")
                 if content_type.startswith("text/event-stream"):
-                    await self._pump_sse(resp)
-                else:
-                    payload = await resp.json(content_type=None)
-                    if payload is not None:
-                        self._emit_message(payload)
+                    async for payload in _sse_events(resp):
+                        emit(payload)
+                elif (payload := await resp.json(content_type=None)) is not None:
+                    emit(payload)
                 return
 
     def _capture_session(self, resp: aiohttp.ClientResponse) -> None:
@@ -111,7 +142,7 @@ class StreamableHttpProxy:
                 self.protocol_version = result["protocolVersion"]
         self.emit(payload)
 
-    def _emit_transport_error(self, request: Dict[str, Any], text: str) -> None:
+    def _emit_transport_error(self, request: dict[str, Any], text: str) -> None:
         """Answer a request the endpoint never processed with a JSON-RPC error."""
         request_id = request.get("id")
         if request_id is None:
@@ -120,24 +151,14 @@ class StreamableHttpProxy:
             {
                 "jsonrpc": "2.0",
                 "id": request_id,
-                "error": {"code": -32001, "message": text},
+                "error": {"code": _TRANSPORT_ERROR_CODE, "message": text},
             }
         )
 
     async def _pump_sse(self, resp: aiohttp.ClientResponse) -> None:
         """Emit each ``data:`` event of an SSE stream as a JSON-RPC message."""
-        data_lines: list[str] = []
-        async for raw in resp.content:
-            line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
-            if line.startswith("data:"):
-                data_lines.append(line[5:].lstrip())
-            elif line == "" and data_lines:
-                data = "\n".join(data_lines)
-                data_lines = []
-                try:
-                    self._emit_message(json.loads(data))
-                except json.JSONDecodeError:
-                    logger.warning("Skipping non-JSON SSE event", data=data[:200])
+        async for payload in _sse_events(resp):
+            self._emit_message(payload)
 
     async def listen_get_stream(self) -> None:
         """Pump the optional server-initiated GET stream, reconnecting politely."""
@@ -164,11 +185,68 @@ class StreamableHttpProxy:
         if not self.session_id:
             return
         try:
-            headers = await self._headers()
-            async with self.session.delete(self.url, headers=headers) as resp:
-                logger.debug("MCP session closed", status=resp.status)
+            async with asyncio.timeout(_CLOSE_TIMEOUT):
+                headers = await self._headers()
+                async with self.session.delete(self.url, headers=headers) as resp:
+                    logger.debug("MCP session closed", status=resp.status)
         except Exception as exc:
-            logger.debug("MCP session close failed", error=str(exc))
+            logger.debug("MCP session close failed", error=_describe(exc))
+
+
+def _is_reply(payload: Any, request_id: Any) -> bool:
+    """Whether ``payload`` answers the request with ``request_id``."""
+    return (
+        request_id is not None
+        and isinstance(payload, dict)
+        and payload.get("id") == request_id
+        and ("result" in payload or "error" in payload)
+    )
+
+
+def _describe(exc: BaseException) -> str:
+    return str(exc) or type(exc).__name__
+
+
+class _SseDecoder:
+    """Incremental SSE parser: feed raw chunks, get back the JSON ``data:`` events.
+
+    Lines are split from raw chunks so an event of any size gets through;
+    aiohttp's line reader caps a line at its read buffer size.
+    """
+
+    __slots__ = ("_data_lines", "_partial")
+
+    def __init__(self) -> None:
+        self._data_lines: list[str] = []
+        self._partial = bytearray()
+
+    def feed(self, chunk: bytes) -> list[Any]:
+        events: list[Any] = []
+        start = 0
+        while (end := chunk.find(b"\n", start)) >= 0:
+            self._partial += chunk[start:end]
+            start = end + 1
+            line = self._partial.decode("utf-8", errors="replace").rstrip("\r")
+            self._partial.clear()
+            if line.startswith("data:"):
+                self._data_lines.append(line[5:].lstrip())
+            elif not line and self._data_lines:
+                data = "\n".join(self._data_lines)
+                self._data_lines.clear()
+                try:
+                    events.append(json.loads(data))
+                except json.JSONDecodeError:
+                    logger.warning("Skipping non-JSON SSE event", data=data[:200])
+        self._partial += chunk[start:]
+        return events
+
+
+async def _sse_events(resp: aiohttp.ClientResponse) -> AsyncIterator[Any]:
+    """Yield each JSON ``data:`` event of an SSE response body."""
+    decoder = _SseDecoder()
+    async for chunk in resp.content.iter_any():
+        for payload in decoder.feed(chunk):
+            yield payload
 
 
 def _configure_stderr_logging() -> None:
@@ -183,14 +261,29 @@ def _configure_stderr_logging() -> None:
     )
 
 
-def _build_oauth_manager(url: str, env_file: Optional[Path]) -> OAuthManager:
+def _client_config_with_base_url(url: str) -> ClientConfig:
+    """Read the env config with BASE_URL set to the MCP URL's origin for this call only."""
+    key = f"{EnvConfig.PREFIX}BASE_URL"
+    previous = os.environ.get(key)
+    parts = urlsplit(url)
+    os.environ[key] = f"{parts.scheme}://{parts.netloc}"
+    try:
+        return EnvConfig.create_client_config()
+    finally:
+        if previous is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = previous
+
+
+def _build_oauth_manager(url: str, env_file: Path | None) -> OAuthManager:
     """Build the OAuth manager from env config."""
     if env_file is not None:
         EnvConfig.load_env_file(env_file)
-    if not EnvConfig.get_env_var("BASE_URL"):
-        parts = urlsplit(url)
-        os.environ[f"{EnvConfig.PREFIX}BASE_URL"] = f"{parts.scheme}://{parts.netloc}"
-    config = EnvConfig.create_client_config()
+    if EnvConfig.get_env_var("BASE_URL"):
+        config = EnvConfig.create_client_config()
+    else:
+        config = _client_config_with_base_url(url)
     oauth = OAuthManager(config)
     if not oauth.is_authenticated():
         raise ConfigurationError(
@@ -199,20 +292,42 @@ def _build_oauth_manager(url: str, env_file: Optional[Path]) -> OAuthManager:
     return oauth
 
 
-async def _read_stdin_lines() -> "asyncio.StreamReader":
+async def _read_stdin_lines() -> asyncio.StreamReader:
     loop = asyncio.get_running_loop()
-    reader = asyncio.StreamReader()
+    reader = asyncio.StreamReader(limit=_STDIN_LIMIT)
     protocol = asyncio.StreamReaderProtocol(reader)
     await loop.connect_read_pipe(lambda: protocol, sys.stdin)
     return reader
 
 
-def _emit_stdout(message: Dict[str, Any]) -> None:
+async def _next_line(reader: asyncio.StreamReader) -> bytes:
+    """Read one stdin line (b"" at EOF), skipping lines over the reader's limit."""
+    oversized = False
+    while True:
+        try:
+            line = await reader.readuntil(b"\n")
+        except asyncio.IncompleteReadError as exc:
+            if oversized:
+                return b""
+            return exc.partial  # last line without a newline, or b"" at EOF
+        except asyncio.LimitOverrunError as exc:
+            # Drop what is buffered of the line and keep reading to its end.
+            if not oversized:
+                logger.warning("Skipping JSON-RPC line over the stdin limit")
+                oversized = True
+            await reader.readexactly(exc.consumed)
+            continue
+        if not oversized:
+            return line
+        oversized = False
+
+
+def _emit_stdout(message: dict[str, Any]) -> None:
     sys.stdout.write(json.dumps(message, separators=(",", ":")) + "\n")
     sys.stdout.flush()
 
 
-async def run_mcp_proxy(url: Optional[str] = None, env_file: Optional[Path] = None) -> int:
+async def run_mcp_proxy(url: str | None = None, env_file: Path | None = None) -> int:
     """Run the stdio <-> Streamable HTTP proxy until stdin closes.
 
     ``url`` defaults to ``DATAQUERY_MCP_URL``, and failing that to the PROD MCP
@@ -228,7 +343,7 @@ async def run_mcp_proxy(url: Optional[str] = None, env_file: Optional[Path] = No
             raise ConfigurationError("No MCP endpoint configured: pass a url or set DATAQUERY_MCP_URL")
         oauth = _build_oauth_manager(url, env_file)
         await oauth.authenticate()
-    except (ConfigurationError, AuthenticationError) as exc:
+    except (ConfigurationError, AuthenticationError, NetworkError) as exc:
         print(f"dataquery mcp connect: {exc}", file=sys.stderr)
         return 1
 
@@ -237,20 +352,23 @@ async def run_mcp_proxy(url: Optional[str] = None, env_file: Optional[Path] = No
         proxy = StreamableHttpProxy(url, oauth, session, _emit_stdout)
         logger.info("MCP proxy connected", url=url)
 
-        get_task: Optional[asyncio.Task] = None
-        pending: set[asyncio.Task] = set()
+        get_task: asyncio.Task[None] | None = None
+        pending: set[asyncio.Task[None]] = set()
 
-        def _track(coro: Awaitable[None]) -> None:
-            task = asyncio.ensure_future(coro)
-            pending.add(task)
-            task.add_done_callback(pending.discard)
+        def _done(task: asyncio.Task[None]) -> None:
+            pending.discard(task)
+            error = None if task.cancelled() else task.exception()
+            if error is not None:
+                logger.error("MCP proxy task failed", error=_describe(error))
+
+        def _spawn(coro: Coroutine[Any, Any, None]) -> asyncio.Task[None]:
+            task = asyncio.create_task(coro)
+            task.add_done_callback(_done)
+            return task
 
         try:
             reader = await _read_stdin_lines()
-            while True:
-                line = await reader.readline()
-                if not line:
-                    break
+            while line := await _next_line(reader):
                 text = line.decode("utf-8", errors="replace").strip()
                 if not text:
                     continue
@@ -259,11 +377,19 @@ async def run_mcp_proxy(url: Optional[str] = None, env_file: Optional[Path] = No
                 except json.JSONDecodeError:
                     logger.warning("Skipping malformed JSON-RPC line", line=text[:200])
                     continue
+                if not isinstance(message, dict):
+                    # Batches were dropped from MCP in 2025-06-18; answer nothing.
+                    logger.warning("Skipping non-object JSON-RPC line", line=text[:200])
+                    continue
                 # Each message runs as its own task so a long streamed
                 # response doesn't block the next client message.
-                _track(proxy.handle_message(message))
+                pending.add(_spawn(proxy.handle_message(message)))
                 if get_task is None and message.get("method") == "notifications/initialized":
-                    get_task = asyncio.ensure_future(proxy.listen_get_stream())
+                    get_task = _spawn(proxy.listen_get_stream())
+            if pending:
+                # stdin closed: let in-flight requests deliver their replies.
+                logger.info("stdin closed, waiting for in-flight requests", count=len(pending))
+                await asyncio.wait(set(pending), timeout=_DRAIN_TIMEOUT)
         finally:
             if get_task is not None:
                 get_task.cancel()

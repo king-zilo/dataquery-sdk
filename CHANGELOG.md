@@ -12,7 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Group download capabilities with intelligent rate limiting
 - Comprehensive test suite with coverage reporting
 ## [0.0.8] - 2025-10-21
-- Made label and expression parameters optional in attribute api response 
+- Made label and expression parameters optional in attribute api response
 ## [0.0.9] - 2025-12-09
 - Performance optimizations
 ## [0.1.0] - 2025-12-10
@@ -20,11 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.1.1] - 2026-02-18
 - Non blocking IO
 ## [0.1.2] - 2026-02-18
-- File already exists status added 
+- File already exists status added
 ## [0.1.3] - 2026-02-21
-- Historical file download added 
+- Historical file download added
 ## [0.1.4] - 2026-03-23
-- Introduced circuit breaker environment variable (`DATAQUERY_CIRCUIT_BREAKER_THRESHOLD`) 
+- Introduced circuit breaker environment variable (`DATAQUERY_CIRCUIT_BREAKER_THRESHOLD`)
 ## [0.1.5] - 2026-04-16
 - Introduced file-group-id to the group downloads
 ## [0.2.0] - 2026-05-06
@@ -45,7 +45,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Group downloads: `run_group_download_async` accepts an `on_file_complete` async callback awaited per file on `completed`/`already_exists`
 - Extraction is Zip Slip-guarded, skips current-day archives, and surfaces failures via `extraction_errors` (downgrading overall status to `partial`); date windows with no available files no longer mark a multi-window run as `partial`
 ## [1.2.2] - 2026-07-18
-- MCP: new `mcp-connect` CLI command  
+- MCP: new `mcp-connect` CLI command
 ## [1.2.3] - 2026-07-23
 - Pagination: new client-driven `get_next_page_async(page)` helper — read `next_link` off any paged response and hand the page back to fetch the next one (manual counterpart to the SDK-driven `iter_pages`); next-page links are resolved against the surface the page came from and never sent off-host
 - Pagination models: `items`, `page-size`, and `info` fields, plus the `next_link` property and `get_self_link()` accessor, moved onto the shared `Paginated` mixin; `FileList` is now paginated; list fields default to empty instead of being required so partial/empty envelopes parse cleanly
@@ -78,3 +78,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - `dataquery auth test` prints `Authentication successful.` on success instead of exiting silently
 
+## [Unreleased]
+### Fixed
+- MCP: `mcp-connect`'s stdio proxy now answers a request with a JSON-RPC error (`-32001`) instead of leaving it unanswered when the endpoint returns a non-JSON body, the OAuth token can't be fetched mid-session, or an SSE response drops before the reply
+- MCP: the proxy skips stdin lines that are valid JSON but not an object (e.g. a batch array), and lines over 64 MiB, instead of exiting; SSE events are no longer limited by aiohttp's line-length cap
+- MCP: at stdin EOF the proxy lets in-flight requests finish (up to 30 s) instead of cancelling them, and the session `DELETE` on shutdown gives up after 5 s
+- MCP: concurrent requests rejected with the same stale token share one token refresh; an unreachable token endpoint at startup prints `dataquery mcp connect: …` and exits 1 instead of a traceback
+- MCP: with `DATAQUERY_BASE_URL` set but empty, the base URL derived from the MCP URL no longer stays in the process environment, so a later proxy in the same process uses its own MCP URL's origin
