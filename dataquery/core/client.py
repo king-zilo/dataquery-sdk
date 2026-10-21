@@ -7,7 +7,7 @@ from collections import OrderedDict
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Tuple, Union
 
 if TYPE_CHECKING:
     from ..sse.subscriber import NotificationDownloadManager
@@ -501,6 +501,63 @@ class DataQueryClient(
 
         return response
 
+    async def _get_groups_page(
+        self,
+        endpoint: str,
+        params: Dict[str, str],
+        limit: Optional[int],
+        offset: Optional[int],
+        page: Optional[str],
+    ) -> GroupList:
+        """Fetch one :class:`GroupList` page, appending the optional paging params."""
+        await self._ensure_connected()
+
+        for key, value in (("limit", limit), ("offset", offset)):
+            if value is not None:
+                params[key] = str(value)
+        if page is not None:
+            params["page"] = page
+
+        url = self._build_api_url(endpoint)
+        async with await self._make_authenticated_request("GET", url, params=params) as response:
+            await self._handle_response(response)
+            data = await response.json()
+            return self._build_page(GroupList, data)
+
+    async def _collect_group_pages(
+        self,
+        pages: "AsyncIterator[GroupList]",
+        *,
+        page_event: str,
+        done_event: str,
+        error_event: str,
+        groups_metric: str,
+        pages_metric: str,
+        **log_context: Any,
+    ) -> List[Group]:
+        """Drain ``pages`` into one list, logging per page and recording totals."""
+        all_groups: List[Group] = []
+        page_count = 0
+        try:
+            async for page in pages:
+                page_count += 1
+                all_groups.extend(page.groups)
+                self.logger.info(
+                    page_event,
+                    page=page_count,
+                    **log_context,
+                    groups_in_page=len(page.groups),
+                    total_groups=len(all_groups),
+                )
+
+            self.logger.info(done_event, **log_context, total_groups=len(all_groups), total_pages=page_count)
+            self.logging_manager.log_metric(groups_metric, len(all_groups), "count")
+            self.logging_manager.log_metric(pages_metric, page_count, "count")
+            return all_groups
+        except Exception as e:
+            self.logger.error(error_event, **log_context, error=str(e))
+            raise
+
     async def list_groups_async(self, limit: Optional[int] = None) -> List[Group]:
         """List available data groups with optional limit."""
         try:
@@ -519,19 +576,7 @@ class DataQueryClient(
         page: Optional[str] = None,
     ) -> GroupList:
         """Return a single :class:`GroupList` page for client-driven pagination."""
-        await self._ensure_connected()
-
-        params: Dict[str, str] = {}
-        if limit is not None:
-            params["limit"] = str(limit)
-        if page is not None:
-            params["page"] = page
-
-        url = self._build_api_url(C.API_GROUPS)
-        async with await self._make_authenticated_request("GET", url, params=params) as response:
-            await self._handle_response(response)
-            data = await response.json()
-            return self._build_page(GroupList, data)
+        return await self._get_groups_page(C.API_GROUPS, {}, limit, None, page)
 
     async def list_all_groups_async(
         self,
@@ -541,33 +586,14 @@ class DataQueryClient(
     ) -> List[Group]:
         """List all available data groups using pagination."""
         await self._ensure_connected()
-
-        all_groups: List[Group] = []
-        page_count = 0
-
-        try:
-            async for page in self.iter_groups_pages_async(max_pages=max_pages, raise_on_cap=raise_on_cap):
-                page_count += 1
-                all_groups.extend(page.groups)
-                self.logger.info(
-                    "Groups page fetched",
-                    page=page_count,
-                    groups_in_page=len(page.groups),
-                    total_groups=len(all_groups),
-                )
-
-            self.logger.info(
-                "All groups fetched",
-                total_groups=len(all_groups),
-                total_pages=page_count,
-            )
-            self.logging_manager.log_metric("groups_listed", len(all_groups), "count")
-            self.logging_manager.log_metric("groups_pages_fetched", page_count, "count")
-            return all_groups
-
-        except Exception as e:
-            self.logger.error("Failed to list all groups", error=str(e))
-            raise
+        return await self._collect_group_pages(
+            self.iter_groups_pages_async(max_pages=max_pages, raise_on_cap=raise_on_cap),
+            page_event="Groups page fetched",
+            done_event="All groups fetched",
+            error_event="Failed to list all groups",
+            groups_metric="groups_listed",
+            pages_metric="groups_pages_fetched",
+        )
 
     async def iter_groups_pages_async(
         self,
@@ -578,10 +604,7 @@ class DataQueryClient(
         """Yield each :class:`GroupList` page; uses the shared ``iter_pages`` walker."""
         await self._ensure_connected()
 
-        async def _first() -> GroupList:
-            return await self.list_groups_page_async()
-
-        async for page in self.iter_pages(_first, max_pages=max_pages, raise_on_cap=raise_on_cap):
+        async for page in self.iter_pages(self.list_groups_page_async, max_pages=max_pages, raise_on_cap=raise_on_cap):
             yield page
 
     async def iter_groups_async(
@@ -620,21 +643,7 @@ class DataQueryClient(
         page: Optional[str] = None,
     ) -> GroupList:
         """Single-page cursor search returning the full :class:`GroupList`."""
-        await self._ensure_connected()
-
-        params: Dict[str, str] = {"keywords": keywords}
-        if limit is not None:
-            params["limit"] = str(limit)
-        if offset is not None:
-            params["offset"] = str(offset)
-        if page is not None:
-            params["page"] = page
-
-        url = self._build_api_url(C.API_GROUPS_SEARCH)
-        async with await self._make_authenticated_request("GET", url, params=params) as response:
-            await self._handle_response(response)
-            data = await response.json()
-            return self._build_page(GroupList, data)
+        return await self._get_groups_page(C.API_GROUPS_SEARCH, {"keywords": keywords}, limit, offset, page)
 
     async def iter_search_groups_pages_async(
         self,
@@ -646,8 +655,8 @@ class DataQueryClient(
     ) -> "AsyncIterator[GroupList]":
         """Yield each :class:`GroupList` page of a keyword search via cursor pagination."""
 
-        async def _first() -> GroupList:
-            return await self.search_groups_page_async(keywords, limit=limit)
+        def _first() -> "Awaitable[GroupList]":
+            return self.search_groups_page_async(keywords, limit=limit)
 
         async for page in self.iter_pages(_first, max_pages=max_pages, raise_on_cap=raise_on_cap):
             yield page
@@ -673,37 +682,15 @@ class DataQueryClient(
         raise_on_cap: bool = True,
     ) -> List[Group]:
         """Materialize every page of a keyword search using cursor pagination."""
-        all_groups: List[Group] = []
-        page_count = 0
-        try:
-            async for page in self.iter_search_groups_pages_async(
-                keywords,
-                limit=limit,
-                max_pages=max_pages,
-                raise_on_cap=raise_on_cap,
-            ):
-                page_count += 1
-                all_groups.extend(page.groups)
-                self.logger.info(
-                    "Search-groups page fetched",
-                    page=page_count,
-                    keywords=keywords,
-                    groups_in_page=len(page.groups),
-                    total_groups=len(all_groups),
-                )
-
-            self.logger.info(
-                "All matching groups fetched",
-                keywords=keywords,
-                total_groups=len(all_groups),
-                total_pages=page_count,
-            )
-            self.logging_manager.log_metric("groups_searched", len(all_groups), "count")
-            self.logging_manager.log_metric("groups_search_pages_fetched", page_count, "count")
-            return all_groups
-        except Exception as e:
-            self.logger.error("Failed to walk all matching groups", keywords=keywords, error=str(e))
-            raise
+        return await self._collect_group_pages(
+            self.iter_search_groups_pages_async(keywords, limit=limit, max_pages=max_pages, raise_on_cap=raise_on_cap),
+            page_event="Search-groups page fetched",
+            done_event="All matching groups fetched",
+            error_event="Failed to walk all matching groups",
+            groups_metric="groups_searched",
+            pages_metric="groups_search_pages_fetched",
+            keywords=keywords,
+        )
 
     async def list_files_async(
         self,

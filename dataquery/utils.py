@@ -319,40 +319,30 @@ def set_env_value(key: str, value: str) -> None:
 
 def validate_env_config() -> None:
     """Validate that required environment variables are set."""
-    timeout = get_env_value("DATAQUERY_TIMEOUT")
-    if timeout:
-        try:
-            float(timeout)
-        except ValueError:
-            raise ValueError(f"Invalid timeout value: {timeout}")
+    for key, parse, label in (
+        ("DATAQUERY_TIMEOUT", float, "timeout"),
+        ("DATAQUERY_MAX_RETRIES", int, "max retries"),
+    ):
+        value = get_env_value(key)
+        if value:
+            try:
+                parse(value)
+            except ValueError:
+                raise ValueError(f"Invalid {label} value: {value}")
 
-    max_retries = get_env_value("DATAQUERY_MAX_RETRIES")
-    if max_retries:
-        try:
-            int(max_retries)
-        except ValueError:
-            raise ValueError(f"Invalid max retries value: {max_retries}")
-
-    oauth_enabled_val = get_env_value("DATAQUERY_OAUTH_ENABLED")
-    if oauth_enabled_val and oauth_enabled_val.lower() not in ("true", "false"):
+    oauth_enabled_val = get_env_value("DATAQUERY_OAUTH_ENABLED") or "false"
+    if oauth_enabled_val.lower() not in ("true", "false"):
         raise ValueError(f"Invalid OAuth enabled value: {oauth_enabled_val}")
 
     base_url = get_env_value("DATAQUERY_BASE_URL")
     if not base_url or not base_url.startswith(("http://", "https://")):
         raise ValueError("DATAQUERY_BASE_URL is required")
 
-    oauth_enabled_val = get_env_value("DATAQUERY_OAUTH_ENABLED", "false")
-    oauth_enabled = (oauth_enabled_val or "false").lower() == "true"
-    if oauth_enabled:
+    if oauth_enabled_val.lower() == "true":
         client_id = get_env_value("DATAQUERY_CLIENT_ID")
         client_secret = get_env_value("DATAQUERY_CLIENT_SECRET")
-        if not client_id or not client_secret or client_id.strip() == "" or client_secret.strip() == "":
+        if not client_id or not client_secret or not client_id.strip() or not client_secret.strip():
             raise ValueError("OAuth credentials are required")
-
-    if not oauth_enabled:
-        bearer_token = get_env_value("DATAQUERY_BEARER_TOKEN")
-        if not bearer_token or bearer_token.strip() == "":
-            pass
 
     logger.info("Environment configuration validation passed")
 
